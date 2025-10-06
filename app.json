@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "swaram-app",
-    "slug": "swaram-app",
+    "slug": "swaram",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -24,6 +24,12 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "ad24aaf9-2db2-40d7-9dfe-80e0c9a1b47d"
+      }
+    },
+    "owner": "akash_pr"
   }
 }
