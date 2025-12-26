@@ -1,25 +1,26 @@
 // navigation/StackNavigator.js
-import React from "react";
-import { createStackNavigator } from "@react-navigation/stack";
-import IntroScreen from "../screens/IntroScreen";
-import HomeScreen from "../screens/HomeScreen";
-import LipReadScreen from "../screens/LipReadScreen";
-import SettingsScreen from "../screens/SettingsScreen";
+import React from 'react';
+import { createStackNavigator } from '@react-navigation/stack';
 
+// Import screens
+import SplashScreen from '../screens/SplashScreen';
+import OnboardingScreen from '../screens/OnboardingScreen';
+import HomeScreen from '../screens/HomeScreen';
+import SettingsScreen from '../screens/SettingsScreen';
 const Stack = createStackNavigator();
 
 export default function StackNavigator() {
   return (
     <Stack.Navigator 
-      initialRouteName="Intro"
+      initialRouteName="Splash"
       screenOptions={{
         headerShown: false,
-        cardStyle: { backgroundColor: '#191A1F' }
+        cardStyle: { backgroundColor: '#0F0F1A' }
       }}
     >
-      <Stack.Screen name="Intro" component={IntroScreen} />
+      <Stack.Screen name="Splash" component={SplashScreen} />
+      <Stack.Screen name="Onboarding" component={OnboardingScreen} />
       <Stack.Screen name="Home" component={HomeScreen} />
-      <Stack.Screen name="LipRead" component={LipReadScreen} />
       <Stack.Screen name="Settings" component={SettingsScreen} />
     </Stack.Navigator>
   );
