@@ -9,10 +9,13 @@ import {
   Dimensions,
   Animated,
   Alert,
+  Linking,
+  Platform,
   StatusBar,
   AppState,
   TextInput,
   ActivityIndicator,
+  Modal,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Card, IconButton, ProgressBar, Chip } from 'react-native-paper';
@@ -20,6 +23,7 @@ import colors from '../constants/colors';
 import CameraFullScreen from './CameraFullScreen';
 import WebSocketService from '../services/WebSocketService';
 import CameraService from '../services/CameraService';
+
 
 const { width, height } = Dimensions.get('window');
 
@@ -44,10 +48,11 @@ export default function HomeScreen({ navigation }) {
   const [serverIp, setServerIp] = useState('192.168.1.9'); // Default IP
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [lastError, setLastError] = useState('');
-  
+  const [cameraPermission, setCameraPermission] = useState(null);
+  const [showPermissionDialog, setShowPermissionDialog] = useState(false);
+
   // Refs
   const pulseAnim = useRef(new Animated.Value(1)).current;
-  const waveAnim = useRef(new Animated.Value(0)).current;
   const translateBtnScale = useRef(new Animated.Value(1)).current;
   const translationBuffer = useRef('');
   const statsRef = useRef({
@@ -60,6 +65,7 @@ export default function HomeScreen({ navigation }) {
   // Initialize services
   useEffect(() => {
     initializeServices();
+    checkCameraPermission();
     
     // Set up WebSocket callbacks
     WebSocketService.setOnTranslation(handleTranslation);
@@ -81,10 +87,92 @@ export default function HomeScreen({ navigation }) {
     };
   }, []);
 
+// In HomeScreen.js, update the checkCameraPermission function
+const checkCameraPermission = async () => {
+  try {
+    console.log('Checking camera permission...');
+    
+    // First check if permission is already requested
+    if (!CameraService.permissionRequested) {
+      console.log('Permission not requested yet, requesting...');
+      const granted = await CameraService.initialize();
+      setCameraPermission(granted);
+      setCameraActive(granted);
+      
+      if (!granted) {
+        // Show custom permission request with explanation
+        setTimeout(() => {
+          setShowPermissionDialog(true);
+        }, 1000);
+      }
+    } else {
+      // Already requested, check current status
+      const hasPermission = await CameraService.checkPermission();
+      console.log('Permission status from check:', hasPermission);
+      setCameraPermission(hasPermission);
+      setCameraActive(hasPermission);
+    }
+  } catch (error) {
+    console.error('Error checking permission:', error);
+    setCameraPermission(false);
+    setCameraActive(false);
+  }
+};
+  const requestCameraPermission = async () => {
+    try {
+      const granted = await CameraService.initialize();
+      setCameraPermission(granted);
+      setCameraActive(granted);
+      
+      if (!granted) {
+        // Show custom permission request with explanation
+        setShowPermissionDialog(true);
+      }
+    } catch (error) {
+      console.error('Permission request error:', error);
+      setCameraPermission(false);
+      setCameraActive(false);
+    }
+  };
+
+const handleRequestCameraPermission = async () => {
+  setShowPermissionDialog(false);
+  const granted = await CameraService.requestPermissionWithExplanation();
+  setCameraPermission(granted);
+  setCameraActive(granted);
+  
+  if (granted) {
+    Alert.alert(
+      'Camera Enabled',
+      'Camera permission granted. You can now use the full-screen camera.',
+      [{ text: 'OK' }]
+    );
+  } else {
+    // If permission still denied, show option to open settings
+    Alert.alert(
+      'Camera Permission Denied',
+      'To use camera features, you need to enable camera permission in your device settings.',
+      [
+        { 
+          text: 'Open Settings', 
+          onPress: () => {
+            if (Platform.OS === 'ios') {
+              Linking.openURL('app-settings:');
+            } else {
+              Linking.openSettings();
+            }
+          }
+        },
+        { 
+          text: 'Cancel', 
+          style: 'cancel' 
+        }
+      ]
+    );
+  }
+};
   const initializeServices = async () => {
     try {
-      await CameraService.initialize();
-      
       // Load saved server IP
       const savedIp = await loadServerIp();
       if (savedIp) {
@@ -247,6 +335,18 @@ export default function HomeScreen({ navigation }) {
       return;
     }
 
+    if (!cameraPermission) {
+      Alert.alert(
+        'Camera Permission Required',
+        'Please enable camera permission to start translation.',
+        [
+          { text: 'Enable Camera', onPress: requestCameraPermission },
+          { text: 'Cancel', style: 'cancel' }
+        ]
+      );
+      return;
+    }
+
     // Start pulse animation for recording indicator
     Animated.loop(
       Animated.sequence([
@@ -308,8 +408,15 @@ export default function HomeScreen({ navigation }) {
       return;
     }
 
-    if (!cameraActive) {
-      Alert.alert('Camera Required', 'Please enable camera for translation');
+    if (!cameraPermission) {
+      Alert.alert(
+        'Camera Required',
+        'Please enable camera permission for translation',
+        [
+          { text: 'Enable Camera', onPress: requestCameraPermission },
+          { text: 'Cancel', style: 'cancel' }
+        ]
+      );
       return;
     }
 
@@ -431,6 +538,12 @@ export default function HomeScreen({ navigation }) {
       Alert.alert('Not Connected', 'Please connect to server first');
       return;
     }
+    
+    if (!cameraPermission) {
+      requestCameraPermission();
+      return;
+    }
+    
     setShowCameraFullScreen(true);
   };
 
@@ -450,6 +563,18 @@ export default function HomeScreen({ navigation }) {
       case 'disconnected': return 'Disconnected';
       default: return 'Unknown';
     }
+  };
+
+  const getCameraPermissionText = () => {
+    if (cameraPermission === null) return 'Checking...';
+    if (cameraPermission === true) return 'Camera Enabled';
+    return 'Camera Disabled';
+  };
+
+  const getCameraPermissionColor = () => {
+    if (cameraPermission === null) return colors.textSecondary;
+    if (cameraPermission === true) return colors.success;
+    return colors.danger;
   };
 
   return (
@@ -527,70 +652,92 @@ export default function HomeScreen({ navigation }) {
       >
         {/* Camera Preview Area */}
         <View style={styles.cameraSection}>
-          <TouchableOpacity 
-            style={[
-              styles.cameraPlaceholder,
-              !isConnected && styles.cameraPlaceholderDisabled
-            ]}
-            onPress={handleFullScreenCamera}
-            activeOpacity={0.8}
-            disabled={!isConnected || isConnecting}
-          >
-            {cameraActive ? (
-              <>
-                {isTranslating && (
-                  <Animated.View 
-                    style={[
-                      styles.cameraActiveIndicator,
-                      { transform: [{ scale: pulseAnim }] }
-                    ]} 
-                  />
-                )}
-                <Text style={styles.cameraText}>
-                  {translationMode === 'sign' ? '🤟 Sign Language Mode' :
-                   translationMode === 'lip' ? '👄 Lip Reading Mode' :
-                   '🤟👄 Hybrid Mode'}
-                </Text>
-                
-                {/* Connection Status */}
-                <View style={styles.cameraStatus}>
-                  <View style={styles.statusIndicator}>
-                    <View style={[
-                      styles.statusDot,
-                      { backgroundColor: getConnectionStatusColor() }
-                    ]} />
-                    <Text style={styles.cameraStatusText}>
-                      {getConnectionStatusText()}
-                    </Text>
-                  </View>
-                  {isProcessing && (
-                    <Text style={styles.processingText}>Processing...</Text>
-                  )}
-                </View>
-                
-                {/* Instructions */}
-                <Text style={styles.cameraHint}>
-                  {isTranslating 
-                    ? 'Recording... Make clear signs/lip movements'
-                    : 'Tap to open full-screen camera'}
-                </Text>
-              </>
-            ) : (
-              <>
-                <Text style={styles.cameraEnableText}>Enable Camera</Text>
-                <Text style={styles.cameraHint}>
-                  {isConnected ? 'Tap to open full screen' : 'Connect to server first'}
-                </Text>
-              </>
-            )}
-            
-            {isConnecting && (
-              <View style={styles.connectingOverlay}>
-                <ActivityIndicator size="large" color={colors.primary} />
-                <Text style={styles.connectingText}>Connecting to server...</Text>
+          {cameraPermission === false ? (
+            <TouchableOpacity 
+              style={[styles.cameraPlaceholder, styles.cameraPermissionPlaceholder]}
+              onPress={requestCameraPermission}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.permissionIcon}>📷</Text>
+              <Text style={styles.permissionTitle}>Camera Disabled</Text>
+              <Text style={styles.permissionText}>
+                Tap to enable camera for sign language translation
+              </Text>
+              <View style={styles.permissionButton}>
+                <Text style={styles.permissionButtonText}>ENABLE CAMERA</Text>
               </View>
-            )}
-          </TouchableOpacity>
+            </TouchableOpacity>
+          ) : cameraPermission === null ? (
+            <View style={[styles.cameraPlaceholder, styles.cameraCheckingPlaceholder]}>
+              <ActivityIndicator size="large" color={colors.primary} />
+              <Text style={styles.checkingText}>Checking camera permission...</Text>
+            </View>
+          ) : (
+            <TouchableOpacity 
+              style={[
+                styles.cameraPlaceholder,
+                (!isConnected || isConnecting) && styles.cameraPlaceholderDisabled
+              ]}
+              onPress={handleFullScreenCamera}
+              activeOpacity={0.8}
+              disabled={!isConnected || isConnecting}
+            >
+              {cameraActive ? (
+                <>
+                  {isTranslating && (
+                    <Animated.View 
+                      style={[
+                        styles.cameraActiveIndicator,
+                        { transform: [{ scale: pulseAnim }] }
+                      ]} 
+                    />
+                  )}
+                  <Text style={styles.cameraText}>
+                    {translationMode === 'sign' ? '🤟 Sign Language Mode' :
+                     translationMode === 'lip' ? '👄 Lip Reading Mode' :
+                     '🤟👄 Hybrid Mode'}
+                  </Text>
+                  
+                  {/* Connection Status */}
+                  <View style={styles.cameraStatus}>
+                    <View style={styles.statusIndicator}>
+                      <View style={[
+                        styles.statusDot,
+                        { backgroundColor: getConnectionStatusColor() }
+                      ]} />
+                      <Text style={styles.cameraStatusText}>
+                        {getConnectionStatusText()}
+                      </Text>
+                    </View>
+                    {isProcessing && (
+                      <Text style={styles.processingText}>Processing...</Text>
+                    )}
+                  </View>
+                  
+                  {/* Instructions */}
+                  <Text style={styles.cameraHint}>
+                    {isTranslating 
+                      ? 'Recording... Make clear signs/lip movements'
+                      : 'Tap to open full-screen camera'}
+                  </Text>
+                </>
+              ) : (
+                <>
+                  <Text style={styles.cameraEnableText}>Camera Ready</Text>
+                  <Text style={styles.cameraHint}>
+                    {isConnected ? 'Tap to open full screen' : 'Connect to server first'}
+                  </Text>
+                </>
+              )}
+              
+              {isConnecting && (
+                <View style={styles.connectingOverlay}>
+                  <ActivityIndicator size="large" color={colors.primary} />
+                  <Text style={styles.connectingText}>Connecting to server...</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          )}
           
           {/* Mode Selection */}
           <View style={styles.modeContainer}>
@@ -631,6 +778,8 @@ export default function HomeScreen({ navigation }) {
                 <Text style={styles.placeholderText}>
                   {!isConnected 
                     ? 'Connect to server to begin'
+                    : cameraPermission === false
+                    ? 'Enable camera permission to begin'
                     : isRecording 
                       ? 'Processing sign/lip movements...' 
                       : 'Press START to begin translation'}
@@ -660,14 +809,21 @@ export default function HomeScreen({ navigation }) {
             style={[
               styles.mainButton,
               isRecording ? styles.stopButton : styles.startButton,
-              (!isConnected || isConnecting) && styles.disabledButton
+              (!isConnected || isConnecting || cameraPermission === false) && styles.disabledButton
             ]}
             onPress={handleStartTranslation}
-            disabled={!isConnected || isConnecting}
+            disabled={!isConnected || isConnecting || cameraPermission === false}
             activeOpacity={0.9}
           >
             {isConnecting ? (
               <ActivityIndicator color="#FFFFFF" />
+            ) : cameraPermission === false ? (
+              <>
+                <Text style={styles.mainButtonText}>📷 ENABLE CAMERA</Text>
+                <Text style={styles.mainButtonSubtext}>
+                  Camera permission required to start translation
+                </Text>
+              </>
             ) : (
               <>
                 <Text style={styles.mainButtonText}>
@@ -801,13 +957,17 @@ export default function HomeScreen({ navigation }) {
         <View style={styles.statusDivider} />
         <View style={styles.statusItem}>
           <Text style={styles.statusText}>
-            {isRecording ? `🔄 Streaming ${processingStats.fps}FPS` : '✅ Ready'}
+            {isRecording ? `🔄 ${processingStats.fps}FPS` : '✅ Ready'}
           </Text>
         </View>
         <View style={styles.statusDivider} />
         <View style={styles.statusItem}>
+          <View style={[
+            styles.statusDot, 
+            { backgroundColor: getCameraPermissionColor() }
+          ]} />
           <Text style={styles.statusText}>
-            Mode: {translationMode.toUpperCase()}
+            {getCameraPermissionText()}
           </Text>
         </View>
       </View>
@@ -821,14 +981,42 @@ export default function HomeScreen({ navigation }) {
         }}
         translationMode={translationMode}
         isTranslating={isTranslating}
-        isConnected={isConnected}
-        serverIp={serverIp}
-        onFrameCapture={(frameBase64) => {
-          if (WebSocketService.isConnected && isRecording) {
-            WebSocketService.sendFrame(frameBase64, translationMode);
-          }
-        }}
+        hasCameraPermission={cameraPermission}
+        onPermissionRequest={requestCameraPermission}
       />
+
+      {/* Camera Permission Dialog */}
+      <Modal
+        visible={showPermissionDialog}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setShowPermissionDialog(false)}
+      >
+        <View style={styles.permissionModal}>
+          <View style={styles.permissionDialog}>
+            <Text style={styles.permissionDialogTitle}>Camera Access Needed</Text>
+            <Text style={styles.permissionDialogText}>
+              To provide sign language translation, this app needs access to your camera.
+              {"\n\n"}
+              Your video is processed locally on your device for maximum privacy.
+            </Text>
+            <View style={styles.permissionDialogButtons}>
+              <TouchableOpacity 
+                style={styles.permissionDialogButtonSecondary}
+                onPress={() => setShowPermissionDialog(false)}
+              >
+                <Text style={styles.permissionDialogButtonTextSecondary}>Not Now</Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                style={styles.permissionDialogButtonPrimary}
+                onPress={handleRequestCameraPermission}
+              >
+                <Text style={styles.permissionDialogButtonTextPrimary}>Allow Camera</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -940,8 +1128,53 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     position: 'relative',
   },
+  cameraPermissionPlaceholder: {
+    backgroundColor: `${colors.warning}15`,
+    borderColor: colors.warning,
+    borderWidth: 2,
+    borderStyle: 'solid',
+  },
+  cameraCheckingPlaceholder: {
+    backgroundColor: `${colors.textSecondary}15`,
+    borderColor: colors.textSecondary,
+  },
   cameraPlaceholderDisabled: {
     opacity: 0.6,
+  },
+  permissionIcon: {
+    fontSize: 40,
+    marginBottom: 15,
+    opacity: 0.7,
+  },
+  permissionTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: colors.warning,
+    marginBottom: 8,
+  },
+  permissionText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    marginBottom: 20,
+    paddingHorizontal: 20,
+  },
+  permissionButton: {
+    backgroundColor: colors.warning,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 25,
+  },
+  permissionButtonText: {
+    color: '#FFFFFF',
+    fontWeight: 'bold',
+    fontSize: 14,
+  },
+  checkingText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    marginTop: 15,
+    textAlign: 'center',
   },
   cameraActiveIndicator: {
     width: 20,
@@ -1313,5 +1546,63 @@ const styles = StyleSheet.create({
     height: 20,
     backgroundColor: '#EAEFFF',
     marginHorizontal: 15,
+  },
+  permissionModal: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  permissionDialog: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    padding: 25,
+    width: '100%',
+    maxWidth: 400,
+  },
+  permissionDialogTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: colors.textPrimary,
+    marginBottom: 15,
+    textAlign: 'center',
+  },
+  permissionDialogText: {
+    fontSize: 16,
+    color: colors.textSecondary,
+    lineHeight: 22,
+    marginBottom: 25,
+    textAlign: 'center',
+  },
+  permissionDialogButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  permissionDialogButtonSecondary: {
+    flex: 1,
+    paddingVertical: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: colors.textSecondary,
+    alignItems: 'center',
+  },
+  permissionDialogButtonTextSecondary: {
+    color: colors.textSecondary,
+    fontWeight: '600',
+    fontSize: 16,
+  },
+  permissionDialogButtonPrimary: {
+    flex: 1,
+    paddingVertical: 14,
+    borderRadius: 12,
+    backgroundColor: colors.primary,
+    alignItems: 'center',
+  },
+  permissionDialogButtonTextPrimary: {
+    color: '#FFFFFF',
+    fontWeight: '600',
+    fontSize: 16,
   },
 });

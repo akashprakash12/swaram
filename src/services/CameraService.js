@@ -1,33 +1,166 @@
+
 // src/services/CameraService.js
 import { Camera } from 'expo-camera';
 import * as FileSystem from 'expo-file-system';
+import { Alert, Platform, Linking } from 'react-native';
 
 class CameraService {
   constructor() {
     this.camera = null;
     this.isStreaming = false;
     this.frameInterval = null;
-    this.frameRate = 15; // Reduced for better performance
+    this.frameRate = 15;
     this.frameCount = 0;
     this.frameBuffer = [];
     this.bufferSize = 10;
     this.processingQueue = [];
+    this.hasPermission = null;
+    this.permissionRequested = false;
   }
 
   async initialize() {
-    const { status } = await Camera.requestCameraPermissionsAsync();
-    if (status !== 'granted') {
-      throw new Error('Camera permission not granted');
+    try {
+      console.log('Requesting camera permission...');
+      
+      // First check current permission status
+      const existingPermission = await Camera.getCameraPermissionsAsync();
+      
+      if (existingPermission.status === 'granted') {
+        console.log('✓ Camera permission already granted');
+        this.hasPermission = true;
+        this.permissionRequested = true;
+        return true;
+      }
+      
+      // Request camera permissions
+      const { status, canAskAgain, granted } = await Camera.requestCameraPermissionsAsync();
+      
+      console.log('Camera permission status:', { status, canAskAgain, granted });
+      
+      this.hasPermission = status === 'granted';
+      this.permissionRequested = true;
+      
+      if (status === 'granted') {
+        console.log('✓ Camera permission granted');
+        return true;
+      } else if (status === 'undetermined') {
+        console.log('Camera permission undetermined');
+        return false;
+      } else if (status === 'denied') {
+        console.log('✗ Camera permission denied');
+        
+        // Check if we can ask again
+        if (!canAskAgain) {
+          // Can't ask again, show alert to guide user to settings
+          this.showPermissionAlert();
+        }
+        return false;
+      }
+      
+      return false;
+    } catch (error) {
+      console.error('Camera permission error:', error);
+      return false;
     }
-    return true;
   }
 
   setCameraRef(ref) {
     this.camera = ref;
   }
 
+  async checkPermission() {
+    try {
+      const { status, canAskAgain } = await Camera.getCameraPermissionsAsync();
+      console.log('Checking camera permission:', { status, canAskAgain });
+      
+      this.hasPermission = status === 'granted';
+      return this.hasPermission;
+    } catch (error) {
+      console.error('Error checking camera permission:', error);
+      return false;
+    }
+  }
+
+  showPermissionAlert() {
+    Alert.alert(
+      'Camera Permission Required',
+      'Camera access is required for sign language translation. Please enable camera permissions in your device settings.',
+      [
+        { 
+          text: 'Open Settings', 
+          onPress: () => this.openAppSettings() 
+        },
+        { 
+          text: 'Cancel', 
+          style: 'cancel' 
+        }
+      ]
+    );
+  }
+
+  async openAppSettings() {
+    try {
+      if (Platform.OS === 'ios') {
+        await Linking.openURL('app-settings:');
+      } else {
+        await Linking.openSettings();
+      }
+    } catch (error) {
+      console.error('Error opening settings:', error);
+      Alert.alert(
+        'Open Settings',
+        'Please open your device settings manually and enable camera permission for this app.',
+        [{ text: 'OK' }]
+      );
+    }
+  }
+
+  async requestPermissionWithExplanation() {
+    try {
+      // Show custom explanation first
+      return new Promise((resolve) => {
+        Alert.alert(
+          'Enable Camera',
+          'This app needs camera access to:\n• Capture sign language gestures\n• Read lip movements\n• Provide real-time translation\n\nYour video is processed locally for privacy.',
+          [
+            {
+              text: 'Allow Camera',
+              onPress: async () => {
+                const granted = await this.initialize();
+                resolve(granted);
+              }
+            },
+            {
+              text: 'Not Now',
+              style: 'cancel',
+              onPress: () => resolve(false)
+            }
+          ]
+        );
+      });
+    } catch (error) {
+      console.error('Permission explanation error:', error);
+      return false;
+    }
+  }
+
   async captureFrame() {
-    if (!this.camera) return null;
+    // Check permission first
+    if (this.hasPermission === null) {
+      const hasPerm = await this.checkPermission();
+      if (!hasPerm) {
+        console.warn('No camera permission to capture frame');
+        return null;
+      }
+    } else if (!this.hasPermission) {
+      console.warn('Camera permission denied');
+      return null;
+    }
+
+    if (!this.camera) {
+      console.warn('Camera reference not set');
+      return null;
+    }
 
     try {
       const photo = await this.camera.takePictureAsync({
@@ -83,12 +216,18 @@ class CameraService {
   startStreaming(onFrameCallback, frameRate = 15) {
     if (this.isStreaming) return;
 
+    // Check permission before streaming
+    if (this.hasPermission === false) {
+      console.warn('Cannot start streaming - no camera permission');
+      return;
+    }
+
     this.isStreaming = true;
     this.frameRate = frameRate;
     const interval = 1000 / frameRate;
 
     this.frameInterval = setInterval(async () => {
-      if (this.camera) {
+      if (this.camera && this.hasPermission) {
         const frameBase64 = await this.captureFrame();
         if (frameBase64 && onFrameCallback) {
           onFrameCallback(frameBase64);
@@ -183,6 +322,15 @@ class CameraService {
       format: 'jpg',
       quality: 'medium',
     };
+  }
+
+  // Getter methods for checking state
+  getPermissionStatus() {
+    return this.hasPermission;
+  }
+
+  isPermissionRequested() {
+    return this.permissionRequested;
   }
 }
 

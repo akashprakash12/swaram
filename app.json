@@ -14,7 +14,11 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.akashpr.swaramapp"
+      "bundleIdentifier": "com.akashpr.swaramapp",
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app uses the camera to capture sign language gestures and lip movements for real-time translation.",
+        "NSMicrophoneUsageDescription": "This app may use the microphone for audio processing in sign language translation."
+      }
     },
     "android": {
       "package": "com.akashpr.swaramapp", 
@@ -22,11 +26,25 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to access your camera",
+          "microphonePermission": "Allow $(PRODUCT_NAME) to access your microphone",
+          "recordAudioAndroid": true
+        }
+      ]
+    ],
     "extra": {
       "eas": {
         "projectId": "ad24aaf9-2db2-40d7-9dfe-80e0c9a1b47d"
