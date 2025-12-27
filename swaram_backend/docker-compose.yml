@@ -1,0 +1,50 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # Model Server
+  model-server:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TF_CPP_MIN_LOG_LEVEL=3
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # WebSocket Server
+  websocket-server:
+    build: ./backend
+    command: python websocket_server.py
+    ports:
+      - "8765:8765"
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - model-server
+    volumes:
+      - ./models:/app/models
+    restart: unless-stopped
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+volumes:
+  redis-data:

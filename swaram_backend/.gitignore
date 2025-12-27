@@ -1,0 +1,88 @@
+#################################
+# Node / React Native / Expo
+#################################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+.expo/
+.expo-shared/
+dist/
+web-build/
+build/
+metro-cache/
+.metro-health-check*
+
+#################################
+# Expo / Native
+#################################
+android/
+ios/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+.kotlin/
+
+#################################
+# Environment files
+#################################
+.env
+.env.*
+expo-env.d.ts
+
+#################################
+# Python
+#################################
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+#################################
+# Python Virtual Environments
+#################################
+venv/
+.venv/
+env/
+ENV/
+swaram_backend/venv/
+
+#################################
+# ML / AI Models (VERY IMPORTANT)
+#################################
+*.h5
+*.pt
+*.onnx
+*.ckpt
+models/
+swaram_backend/models/
+
+#################################
+# Logs & Debug
+#################################
+*.log
+debug.log
+
+#################################
+# Docker
+#################################
+docker-compose.override.yml
+*.tar
+
+#################################
+# OS Files
+#################################
+.DS_Store
+Thumbs.db
+
+#################################
+# IDEs
+#################################
+.vscode/
+.idea/
+*.swp
