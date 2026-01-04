@@ -1,16 +1,13 @@
-// src/services/WebSocketService.js
+// src/services/WebSocketService.js - UPDATED VERSION
 import { Platform } from 'react-native';
 
-// Server Configuration
 const SERVER_CONFIG = {
   development: {
-    // Try these addresses in order
     wsUrls: [
-      'ws://10.0.2.2:8765',        // Android Emulator
-      'ws://localhost:8765', 
-      'ws://192.168.1.9:8765',      // iOS Simulator
-      'ws://192.168.1.9:8765',   // Your LAN IP - UPDATE THIS
-      'ws://192.168.1.9:8765',   // Alternative LAN IP
+      'ws://10.0.2.2:8765',
+      'ws://localhost:8765',
+      'ws://192.168.1.9:8765',
+      'ws://192.168.196.170:8765',
     ],
     apiUrl: 'http://localhost:5000',
   },
@@ -20,7 +17,6 @@ const SERVER_CONFIG = {
   },
 };
 
-// Get current environment
 const ENV = __DEV__ ? 'development' : 'production';
 const CONFIG = SERVER_CONFIG[ENV];
 
@@ -39,13 +35,18 @@ class WebSocketService {
       onConnected: null,
       onDisconnected: null,
       onConnecting: null,
+      onDetection: null,
+      onControlResponse: null,
+      onHealth: null,
+      onStatus: null,
     };
-    this.connectionTimeout = 5000; // 5 seconds
+    this.connectionTimeout = 5000;
+    this.handshakeCompleted = false;
   }
 
   async connect(customUrl = null) {
-    // Cancel any existing connection
     this.disconnect();
+    this.handshakeCompleted = false;
     
     const urlsToTry = customUrl ? [customUrl] : CONFIG.wsUrls;
     
@@ -72,7 +73,6 @@ class WebSocketService {
           console.log(`✗ Failed to connect to ${url}:`, error.message);
           
           if (i === urlsToTry.length - 1) {
-            // Last URL failed
             reject(new Error(`Failed to connect to any server. Last error: ${error.message}`));
           }
         }
@@ -100,8 +100,8 @@ class WebSocketService {
           this.isConnected = true;
           this.reconnectAttempts = 0;
           
-          // Send initial handshake
-          this.sendHandshake();
+          // DON'T send handshake immediately - wait for server's welcome
+          // The server will send 'welcome' message first
           
           // Process queued messages
           this.processMessageQueue();
@@ -125,7 +125,6 @@ class WebSocketService {
           clearTimeout(timeoutId);
           console.error('WebSocket error:', error);
           
-          // Extract readable error message
           let errorMessage = 'Connection error';
           if (error.message) {
             errorMessage = error.message;
@@ -141,17 +140,16 @@ class WebSocketService {
           clearTimeout(timeoutId);
           console.log(`WebSocket disconnected. Code: ${event.code}, Reason: ${event.reason}`);
           this.isConnected = false;
+          this.handshakeCompleted = false;
           
           if (this.callbacks.onDisconnected) {
             this.callbacks.onDisconnected(event.code, event.reason);
           }
           
-          // Don't auto-reconnect if we intentionally closed
           if (event.code !== 1000) {
             this.attemptReconnection();
           }
           
-          // If this was during connection attempt, reject the promise
           if (!this.isConnected) {
             reject(new Error('Connection closed'));
           }
@@ -163,17 +161,6 @@ class WebSocketService {
         reject(error);
       }
     });
-  }
-  
-  sendHandshake() {
-    const handshake = {
-      type: 'handshake',
-      client: 'react-native-app',
-      platform: Platform.OS,
-      version: '1.0.0',
-      timestamp: Date.now(),
-    };
-    this.sendMessage(handshake);
   }
 
   attemptReconnection() {
@@ -197,6 +184,12 @@ class WebSocketService {
   }
 
   sendFrame(frameBase64, mode = 'both') {
+    // Only send frames if handshake is completed
+    if (!this.handshakeCompleted) {
+      console.log('Waiting for handshake completion before sending frames');
+      return false;
+    }
+    
     const message = {
       type: 'frame',
       frame: frameBase64,
@@ -206,13 +199,14 @@ class WebSocketService {
       frame_id: Date.now().toString(36) + Math.random().toString(36).substr(2),
     };
     
-    this.sendMessage(message);
+    return this.sendMessage(message);
   }
 
   sendMessage(message) {
     if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(JSON.stringify(message));
+        console.log(`Sent message type: ${message.type}`);
         return true;
       } catch (error) {
         console.error('Error sending WebSocket message:', error);
@@ -235,92 +229,135 @@ class WebSocketService {
     }
   }
 
-// src/services/WebSocketService.js
-// In the handleIncomingMessage method, add these cases:
+  handleIncomingMessage(data) {
+    if (!data || !data.type) {
+      console.warn('Received message without type:', data);
+      return;
+    }
+    
+    console.log(`Received message type: ${data.type}`);
+    
+    switch (data.type) {
+      case 'welcome':
+        console.log('✓ Server connected:', data.message);
+        console.log('Features:', data.features || 'Unknown');
+        
+        // Server sent welcome, now we send handshake
+        this.sendClientHandshake();
+        break;
+        
+      case 'handshake_ack':
+        console.log('✓ Handshake acknowledged by server');
+        this.handshakeCompleted = true;
+        
+        if (this.callbacks.onStatus) {
+          this.callbacks.onStatus({
+            type: 'status',
+            message: 'Handshake completed, ready to send frames',
+            timestamp: Date.now()
+          });
+        }
+        break;
+        
+      case 'detection':
+        console.log('Detection received:', {
+          hands: data.detection?.handCount || 0,
+          lips: data.detection?.lipDetected || false,
+          confidence: data.detection?.confidence || 0,
+          gesture: data.detection?.gesture || 'unknown'
+        });
+        
+        if (this.callbacks.onDetection) {
+          this.callbacks.onDetection(data);
+        }
+        break;
+        
+      case 'translation':
+        console.log('Translation received:', data.data?.character);
+        if (this.callbacks.onTranslation) {
+          this.callbacks.onTranslation(data.data);
+        }
+        break;
+        
+      case 'stats':
+        if (this.callbacks.onStats) {
+          this.callbacks.onStats(data);
+        }
+        break;
 
-handleIncomingMessage(data) {
-  if (!data || !data.type) {
-    console.warn('Received message without type:', data);
-    return;
+      case 'error':
+        console.error('Server error:', data.message);
+        if (this.callbacks.onError) {
+          this.callbacks.onError(data.message);
+        }
+        break;
+
+      case 'mode_changed':
+        console.log('Mode changed to:', data.mode);
+        break;
+        
+      case 'control_response':
+        console.log('Control response:', data.command, data.status);
+        if (this.callbacks.onControlResponse) {
+          this.callbacks.onControlResponse(data);
+        }
+        break;
+
+      case 'health':
+        console.log('Server health check:', data.status);
+        if (this.callbacks.onHealth) {
+          this.callbacks.onHealth(data);
+        }
+        break;
+
+      case 'status':
+        console.log('Server status:', data.message);
+        if (this.callbacks.onStatus) {
+          this.callbacks.onStatus(data);
+        }
+        break;
+
+      case 'pong':
+        console.log('Pong received from server');
+        break;
+
+      default:
+        console.log('Unknown message type:', data.type, data);
+    }
   }
-  
-  switch (data.type) {
-    case 'welcome':
-      console.log('Server welcome:', data.message);
-      break;
-      
-    case 'pong':
-      console.log('Server pong received');
-      break;
-      
-    case 'translation':
-      if (this.callbacks.onTranslation) {
-        this.callbacks.onTranslation(data.data);
-      }
-      break;
 
-    case 'stats':
-      if (this.callbacks.onStats) {
-        this.callbacks.onStats(data);
-      }
-      break;
-
-    case 'error':
-      console.error('Server error:', data.message);
-      if (this.callbacks.onError) {
-        this.callbacks.onError(data.message);
-      }
-      break;
-
-    case 'mode_changed':
-      console.log('Mode changed to:', data.mode);
-      break;
-      
-    case 'handshake_ack':
-      console.log('Handshake acknowledged by server');
-      break;
-
-    // NEW: Handle control_response
-    case 'control_response':
-      console.log('Control response:', data.command, data.status);
-      if (this.callbacks.onControlResponse) {
-        this.callbacks.onControlResponse(data);
-      }
-      break;
-
-    // NEW: Handle health messages
-    case 'health':
-      console.log('Server health check:', data.status);
-      if (this.callbacks.onHealth) {
-        this.callbacks.onHealth(data);
-      }
-      break;
-
-    // NEW: Handle status messages
-    case 'status':
-      console.log('Server status:', data.message);
-      if (this.callbacks.onStatus) {
-        this.callbacks.onStatus(data);
-      }
-      break;
-
-    default:
-      console.log('Unknown message type:', data.type, data);
+  // Send client handshake to server (after receiving welcome)
+  sendClientHandshake() {
+    const handshake = {
+      type: 'handshake',
+      client: 'react-native-app',
+      platform: Platform.OS,
+      version: '1.0.0',
+      timestamp: Date.now(),
+    };
+    
+    console.log('Sending client handshake to server...');
+    this.sendMessage(handshake);
   }
-}
 
-// Add new callback setter
-setOnControlResponse(callback) {
-  this.callbacks.onControlResponse = callback;
-}
+  // REMOVED sendHandshakeAck() - Server sends handshake_ack, we receive it
 
-setOnHealth(callback) {
-  this.callbacks.onHealth = callback;
-}
+  setOnDetection(callback) {
+    this.callbacks.onDetection = callback;
+  }
 
-setOnStatus(callback) {
-  this.callbacks.onStatus = callback;
-}
+  setOnControlResponse(callback) {
+    this.callbacks.onControlResponse = callback;
+  }
+
+  setOnHealth(callback) {
+    this.callbacks.onHealth = callback;
+  }
+
+  setOnStatus(callback) {
+    this.callbacks.onStatus = callback;
+  }
+
   changeMode(mode) {
     const validModes = ['sign', 'lip', 'both'];
     if (!validModes.includes(mode)) {
@@ -333,14 +370,15 @@ setOnStatus(callback) {
       mode: mode,
       timestamp: Date.now(),
     };
-    this.sendMessage(message);
+    
+    return this.sendMessage(message);
   }
 
   sendControl(command) {
     const validCommands = ['start', 'stop', 'pause', 'resume'];
     if (!validCommands.includes(command)) {
       console.error('Invalid command:', command);
-      return;
+      return false;
     }
     
     const message = {
@@ -348,7 +386,8 @@ setOnStatus(callback) {
       command: command,
       timestamp: Date.now(),
     };
-    this.sendMessage(message);
+    
+    return this.sendMessage(message);
   }
 
   ping() {
@@ -356,21 +395,21 @@ setOnStatus(callback) {
       type: 'ping',
       timestamp: Date.now(),
     };
-    this.sendMessage(message);
+    
+    return this.sendMessage(message);
   }
 
   disconnect() {
     if (this.ws) {
-      // Clear any pending messages
       this.messageQueue = [];
       
-      // Close connection gracefully
       if (this.ws.readyState === WebSocket.OPEN) {
         this.ws.close(1000, 'Client disconnected');
       }
       
       this.ws = null;
       this.isConnected = false;
+      this.handshakeCompleted = false;
       console.log('WebSocket disconnected by client');
     }
   }
@@ -382,7 +421,7 @@ setOnStatus(callback) {
       case WebSocket.CONNECTING:
         return 'connecting';
       case WebSocket.OPEN:
-        return 'connected';
+        return this.handshakeCompleted ? 'connected' : 'handshaking';
       case WebSocket.CLOSING:
         return 'closing';
       case WebSocket.CLOSED:
@@ -392,7 +431,6 @@ setOnStatus(callback) {
     }
   }
 
-  // Callback setters
   setOnTranslation(callback) {
     this.callbacks.onTranslation = callback;
   }
@@ -418,6 +456,5 @@ setOnStatus(callback) {
   }
 }
 
-// Singleton instance
 const webSocketService = new WebSocketService();
 export default webSocketService;

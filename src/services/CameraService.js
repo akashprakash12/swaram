@@ -1,8 +1,8 @@
-
-// src/services/CameraService.js
+// src/services/CameraService.js - UPDATED
 import { Camera } from 'expo-camera';
 import * as FileSystem from 'expo-file-system';
 import { Alert, Platform, Linking } from 'react-native';
+import WebSocketService from './WebSocketService';
 
 class CameraService {
   constructor() {
@@ -16,6 +16,10 @@ class CameraService {
     this.processingQueue = [];
     this.hasPermission = null;
     this.permissionRequested = false;
+    this.streamingMode = 'both';
+    this.lastFrameTime = 0;
+    this.frameIntervalMs = 1000 / this.frameRate;
+    this.isProcessing = false;
   }
 
   async initialize() {
@@ -51,7 +55,6 @@ class CameraService {
         
         // Check if we can ask again
         if (!canAskAgain) {
-          // Can't ask again, show alert to guide user to settings
           this.showPermissionAlert();
         }
         return false;
@@ -66,6 +69,155 @@ class CameraService {
 
   setCameraRef(ref) {
     this.camera = ref;
+  }
+
+  async captureFrame() {
+    // Check permission first
+    if (this.hasPermission === null) {
+      const hasPerm = await this.checkPermission();
+      if (!hasPerm) {
+        console.warn('No camera permission to capture frame');
+        return null;
+      }
+    } else if (!this.hasPermission) {
+      console.warn('Camera permission denied');
+      return null;
+    }
+
+    if (!this.camera) {
+      console.warn('Camera reference not set');
+      return null;
+    }
+
+    try {
+      // Capture photo as base64
+      const photo = await this.camera.takePictureAsync({
+        quality: 0.5, // Lower quality for faster transmission
+        base64: true,
+        exif: false,
+        skipProcessing: true, // Skip processing for speed
+      });
+
+      if (!photo.base64) {
+        console.warn('No base64 data in photo');
+        return null;
+      }
+
+      console.log(`Captured frame (${photo.base64.length} bytes)`);
+      return photo.base64;
+    } catch (error) {
+      console.error('Error capturing frame:', error);
+      return null;
+    }
+  }
+
+  // NEW: Optimized frame capture for streaming
+  async captureFrameForStream() {
+    try {
+      if (!this.camera || !this.hasPermission) {
+        return null;
+      }
+
+      const photo = await this.camera.takePictureAsync({
+        quality: 0.3, // Very low quality for fast streaming
+        base64: true,
+        exif: false,
+        skipProcessing: true,
+      });
+
+      return photo.base64;
+    } catch (error) {
+      console.error('Stream capture error:', error);
+      return null;
+    }
+  }
+
+  // UPDATED: Start streaming that actually sends frames
+  startStreaming(onFrameCallback, frameRate = 15, mode = 'both') {
+    if (this.isStreaming) {
+      console.log('Already streaming');
+      return;
+    }
+
+    // Check permission
+    if (this.hasPermission === false) {
+      console.warn('Cannot start streaming - no camera permission');
+      return;
+    }
+
+    // Check WebSocket connection
+    if (!WebSocketService.isConnected) {
+      console.warn('WebSocket not connected, cannot stream');
+      return;
+    }
+
+    this.isStreaming = true;
+    this.frameRate = frameRate;
+    this.streamingMode = mode;
+    this.frameIntervalMs = 1000 / frameRate;
+    this.lastFrameTime = Date.now();
+    this.frameCount = 0;
+
+    console.log(`Starting streaming at ${frameRate} FPS, mode: ${mode}`);
+
+    // Start frame capture loop
+    this.frameInterval = setInterval(async () => {
+      if (!this.isStreaming || !this.camera || !this.hasPermission) {
+        return;
+      }
+
+      // Throttle if we're processing too fast
+      const now = Date.now();
+      const timeSinceLastFrame = now - this.lastFrameTime;
+      
+      if (timeSinceLastFrame < this.frameIntervalMs) {
+        return; // Skip this frame to maintain frame rate
+      }
+
+      this.lastFrameTime = now;
+      this.frameCount++;
+
+      try {
+        // Capture frame
+        const frameBase64 = await this.captureFrameForStream();
+        
+        if (frameBase64 && WebSocketService.isConnected) {
+          // Send frame to WebSocket server
+          WebSocketService.sendFrame(frameBase64, this.streamingMode);
+          
+          // Callback for UI updates
+          if (onFrameCallback) {
+            onFrameCallback(frameBase64);
+          }
+
+          // Log every 30 frames
+          if (this.frameCount % 30 === 0) {
+            console.log(`Sent ${this.frameCount} frames to server`);
+          }
+        } else if (!frameBase64) {
+          console.log('Failed to capture frame');
+        } else if (!WebSocketService.isConnected) {
+          console.log('WebSocket disconnected, stopping stream');
+          this.stopStreaming();
+        }
+      } catch (error) {
+        console.error('Error in streaming loop:', error);
+      }
+    }, this.frameIntervalMs);
+
+    console.log('Streaming started successfully');
+  }
+
+  stopStreaming() {
+    if (this.frameInterval) {
+      clearInterval(this.frameInterval);
+      this.frameInterval = null;
+    }
+    
+    this.isStreaming = false;
+    this.frameCount = 0;
+    
+    console.log('Streaming stopped');
   }
 
   async checkPermission() {
@@ -117,7 +269,6 @@ class CameraService {
 
   async requestPermissionWithExplanation() {
     try {
-      // Show custom explanation first
       return new Promise((resolve) => {
         Alert.alert(
           'Enable Camera',
@@ -144,187 +295,7 @@ class CameraService {
     }
   }
 
-  async captureFrame() {
-    // Check permission first
-    if (this.hasPermission === null) {
-      const hasPerm = await this.checkPermission();
-      if (!hasPerm) {
-        console.warn('No camera permission to capture frame');
-        return null;
-      }
-    } else if (!this.hasPermission) {
-      console.warn('Camera permission denied');
-      return null;
-    }
-
-    if (!this.camera) {
-      console.warn('Camera reference not set');
-      return null;
-    }
-
-    try {
-      const photo = await this.camera.takePictureAsync({
-        quality: 0.5,
-        base64: true,
-        exif: false,
-      });
-
-      return photo.base64;
-    } catch (error) {
-      console.error('Error capturing frame:', error);
-      return null;
-    }
-  }
-
-  async captureHighQualityFrame() {
-    if (!this.camera) return null;
-
-    try {
-      const photo = await this.camera.takePictureAsync({
-        quality: 1,
-        base64: true,
-        exif: false,
-      });
-
-      return photo.base64;
-    } catch (error) {
-      console.error('Error capturing HQ frame:', error);
-      return null;
-    }
-  }
-
-  async processFrameForSignLanguage(frameBase64) {
-    // Extract hand landmarks using TensorFlow.js
-    // This is a placeholder - integrate with actual TFJS model
-    return {
-      landmarks: [],
-      confidence: 0.8,
-      timestamp: Date.now(),
-    };
-  }
-
-  async processFrameForLipReading(frameBase64) {
-    // Extract lip region and features
-    // This is a placeholder - integrate with actual TFJS model
-    return {
-      lip_features: [],
-      confidence: 0.7,
-      timestamp: Date.now(),
-    };
-  }
-
-  startStreaming(onFrameCallback, frameRate = 15) {
-    if (this.isStreaming) return;
-
-    // Check permission before streaming
-    if (this.hasPermission === false) {
-      console.warn('Cannot start streaming - no camera permission');
-      return;
-    }
-
-    this.isStreaming = true;
-    this.frameRate = frameRate;
-    const interval = 1000 / frameRate;
-
-    this.frameInterval = setInterval(async () => {
-      if (this.camera && this.hasPermission) {
-        const frameBase64 = await this.captureFrame();
-        if (frameBase64 && onFrameCallback) {
-          onFrameCallback(frameBase64);
-        }
-      }
-    }, interval);
-  }
-
-  stopStreaming() {
-    if (this.frameInterval) {
-      clearInterval(this.frameInterval);
-      this.frameInterval = null;
-    }
-    this.isStreaming = false;
-  }
-
-  async captureSequence(duration = 3000) {
-    const frames = [];
-    const interval = 1000 / this.frameRate;
-    const framesCount = Math.floor(duration / interval);
-
-    for (let i = 0; i < framesCount; i++) {
-      const frame = await this.captureFrame();
-      if (frame) {
-        frames.push(frame);
-      }
-      await this.sleep(interval);
-    }
-
-    return frames;
-  }
-
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  async saveFramesToDisk(frames, folderName = 'sign_language_frames') {
-    const folderPath = `${FileSystem.documentDirectory}${folderName}/`;
-    await FileSystem.makeDirectoryAsync(folderPath, { intermediates: true });
-
-    const savedPaths = [];
-    for (let i = 0; i < frames.length; i++) {
-      const filePath = `${folderPath}frame_${i}.jpg`;
-      await FileSystem.writeAsStringAsync(filePath, frames[i], {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-      savedPaths.push(filePath);
-    }
-
-    return savedPaths;
-  }
-
-  async loadFramesFromDisk(folderName = 'sign_language_frames') {
-    const folderPath = `${FileSystem.documentDirectory}${folderName}/`;
-    const files = await FileSystem.readDirectoryAsync(folderPath);
-    
-    const frames = [];
-    for (const file of files.sort()) {
-      if (file.endsWith('.jpg')) {
-        const filePath = `${folderPath}${file}`;
-        const content = await FileSystem.readAsStringAsync(filePath, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
-        frames.push(content);
-      }
-    }
-
-    return frames;
-  }
-
-  async clearFrames(folderName = 'sign_language_frames') {
-    const folderPath = `${FileSystem.documentDirectory}${folderName}/`;
-    try {
-      await FileSystem.deleteAsync(folderPath);
-      return true;
-    } catch (error) {
-      console.error('Error clearing frames:', error);
-      return false;
-    }
-  }
-
-  async optimizeFrame(frameBase64, quality = 0.5) {
-    // This is a simplified version
-    // In production, use a proper image compression library
-    return frameBase64; // Placeholder
-  }
-
-  async extractFrameMetadata(frameBase64) {
-    return {
-      size: frameBase64.length,
-      timestamp: Date.now(),
-      format: 'jpg',
-      quality: 'medium',
-    };
-  }
-
-  // Getter methods for checking state
+  // Getter methods
   getPermissionStatus() {
     return this.hasPermission;
   }
@@ -332,8 +303,15 @@ class CameraService {
   isPermissionRequested() {
     return this.permissionRequested;
   }
+
+  isStreamingActive() {
+    return this.isStreaming;
+  }
+
+  getFrameCount() {
+    return this.frameCount;
+  }
 }
 
-// Singleton instance
 const cameraService = new CameraService();
 export default cameraService;

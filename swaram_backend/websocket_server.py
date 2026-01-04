@@ -7,14 +7,119 @@ import numpy as np
 import base64
 import time
 import traceback
-from model_server import RealTimeProcessor
+import mediapipe as mp
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
+class DetectionProcessor:
+    def __init__(self):
+        self.mp_holistic = mp.solutions.holistic
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.hand_connections = [
+            [0, 1], [1, 2], [2, 3], [3, 4],  # Thumb
+            [0, 5], [5, 6], [6, 7], [7, 8],  # Index
+            [0, 9], [9, 10], [10, 11], [11, 12],  # Middle
+            [0, 13], [13, 14], [14, 15], [15, 16],  # Ring
+            [0, 17], [17, 18], [18, 19], [19, 20]  # Pinky
+        ]
+        self.lip_indices = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+    def extract_detection_data(self, frame, mode):
+        """Extract hand and lip landmarks from frame"""
+        detection_data = {
+            'handLandmarks': [],
+            'lipLandmarks': [],
+            'handConnections': self.hand_connections,
+            'handBoundingBox': None,
+            'lipBoundingBox': None,
+            'handCount': 0,
+            'lipDetected': False,
+            'confidence': 0,
+            'timestamp': time.time()
+        }
+        
+        try:
+            with self.mp_holistic.Holistic(
+                static_image_mode=False,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5
+            ) as holistic:
+                
+                image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = holistic.process(image_rgb)
+                
+                # Extract hand landmarks
+                hand_landmarks_list = []
+                if mode in ['sign', 'both']:
+                    if results.left_hand_landmarks:
+                        hand_landmarks_list.append(results.left_hand_landmarks)
+                        detection_data['handCount'] += 1
+                    if results.right_hand_landmarks:
+                        hand_landmarks_list.append(results.right_hand_landmarks)
+                        detection_data['handCount'] += 1
+                
+                for hand_landmarks in hand_landmarks_list:
+                    for landmark in hand_landmarks.landmark:
+                        detection_data['handLandmarks'].append({
+                            'x': landmark.x,
+                            'y': landmark.y,
+                            'z': landmark.z
+                        })
+                
+                # Extract lip landmarks
+                if mode in ['lip', 'both'] and results.face_landmarks:
+                    detection_data['lipDetected'] = True
+                    for idx in self.lip_indices:
+                        if idx < len(results.face_landmarks.landmark):
+                            landmark = results.face_landmarks.landmark[idx]
+                            detection_data['lipLandmarks'].append({
+                                'x': landmark.x,
+                                'y': landmark.y,
+                                'z': landmark.z
+                            })
+                
+                # Calculate bounding boxes
+                if detection_data['handLandmarks']:
+                    xs = [lm['x'] for lm in detection_data['handLandmarks']]
+                    ys = [lm['y'] for lm in detection_data['handLandmarks']]
+                    if xs and ys:
+                        detection_data['handBoundingBox'] = {
+                            'x': min(xs),
+                            'y': min(ys),
+                            'width': max(xs) - min(xs),
+                            'height': max(ys) - min(ys)
+                        }
+                        detection_data['confidence'] = 0.8
+                
+                if detection_data['lipLandmarks']:
+                    xs = [lm['x'] for lm in detection_data['lipLandmarks']]
+                    ys = [lm['y'] for lm in detection_data['lipLandmarks']]
+                    if xs and ys:
+                        detection_data['lipBoundingBox'] = {
+                            'x': min(xs),
+                            'y': min(ys),
+                            'width': max(xs) - min(xs),
+                            'height': max(ys) - min(ys)
+                        }
+                        detection_data['confidence'] = max(detection_data['confidence'], 0.7)
+                
+                # Calculate overall confidence
+                if detection_data['handCount'] > 0 or detection_data['lipDetected']:
+                    detection_data['confidence'] = max(detection_data['confidence'], 0.6)
+                    
+        except Exception as e:
+            print(f"Detection extraction error: {e}")
+            traceback.print_exc()
+        
+        return detection_data
 
 class WebSocketServer:
     def __init__(self):
-        self.processor = RealTimeProcessor()
+        self.detection_processor = DetectionProcessor()
         self.connections = set()
         self.frame_rate = 30
-        self.max_frame_size = 1024 * 1024  # 1MB max frame size
+        self.max_frame_size = 1024 * 1024
         
     async def handle_connection(self, websocket, path=None):
         """Handle WebSocket connection"""
@@ -29,13 +134,13 @@ class WebSocketServer:
         self.connections.add(websocket)
         
         try:
-            # Send welcome message
             welcome_msg = {
                 'type': 'welcome',
-                'message': 'Connected to Malayalam Sign Language & Lip Reading Server',
+                'message': 'Connected to Sign Language Detection Server',
                 'timestamp': time.time(),
                 'supported_modes': ['sign', 'lip', 'both'],
-                'server_version': '1.0.0'
+                'server_version': '1.0.0',
+                'detection_features': ['hand_landmarks', 'lip_landmarks', 'bounding_boxes']
             }
             await websocket.send(json.dumps(welcome_msg))
             
@@ -78,7 +183,6 @@ class WebSocketServer:
         message_type = data.get('type')
         
         if message_type == 'ping':
-            # Respond to ping
             await websocket.send(json.dumps({
                 'type': 'pong',
                 'timestamp': time.time(),
@@ -86,12 +190,21 @@ class WebSocketServer:
             }))
             
         elif message_type == 'handshake':
-            # Acknowledge handshake
+            # Client is initiating handshake
             await websocket.send(json.dumps({
                 'type': 'handshake_ack',
                 'message': 'Handshake received',
                 'timestamp': time.time(),
                 'client_info': data
+            }))
+            
+        elif message_type == 'handshake_ack':
+            # Client is acknowledging our handshake
+            print(f"Client {client_id} acknowledged handshake")
+            await websocket.send(json.dumps({
+                'type': 'status',
+                'message': 'Handshake completed successfully',
+                'timestamp': time.time()
             }))
             
         elif message_type == 'frame':
@@ -112,9 +225,8 @@ class WebSocketServer:
             }))
     
     async def process_frame(self, websocket, client_id, data):
-        """Process incoming frame"""
+        """Process incoming frame with detection"""
         try:
-            # Validate frame data
             frame_data = data.get('frame')
             if not frame_data:
                 await websocket.send(json.dumps({
@@ -124,16 +236,14 @@ class WebSocketServer:
                 }))
                 return
             
-            # Check frame size
             if len(frame_data) > self.max_frame_size:
                 await websocket.send(json.dumps({
                     'type': 'error',
-                    'message': f'Frame too large: {len(frame_data)} bytes (max: {self.max_frame_size})',
+                    'message': f'Frame too large: {len(frame_data)} bytes',
                     'timestamp': time.time()
                 }))
                 return
             
-            # Decode base64 frame
             try:
                 frame_bytes = base64.b64decode(frame_data)
                 nparr = np.frombuffer(frame_bytes, np.uint8)
@@ -150,48 +260,52 @@ class WebSocketServer:
                 }))
                 return
             
-            # Get processing mode
             mode = data.get('mode', 'both')
             valid_modes = ['sign', 'lip', 'both']
             if mode not in valid_modes:
                 mode = 'both'
             
-            # Add frame to processor
-            self.processor.add_frame(frame)
+            # Extract detection data in separate thread
+            detection_data = await asyncio.get_event_loop().run_in_executor(
+                self.detection_processor.executor,
+                self.detection_processor.extract_detection_data,
+                frame, mode
+            )
             
-            # Get latest result
-            result = self.processor.get_latest_result()
+            # Send detection data
+            detection_response = {
+                'type': 'detection',
+                'detection': detection_data,
+                'timestamp': time.time(),
+                'frame_id': data.get('frame_id', 'unknown'),
+                'mode': mode
+            }
+            await websocket.send(json.dumps(detection_response))
             
-            if result:
-                # Send result back
-                response = {
-                    'type': 'translation',
-                    'data': result,
-                    'timestamp': time.time(),
-                    'frame_id': data.get('frame_id', 'unknown')
-                }
-                await websocket.send(json.dumps(response))
-                
-                # Send stats
-                stats = {
-                    'type': 'stats',
-                    'fps': self.frame_rate,
-                    'queue_size': self.processor.processing_queue.qsize(),
-                    'buffer_fill': len(self.processor.frame_buffer),
-                    'latency': result.get('processing_time', 0),
-                    'timestamp': time.time()
-                }
-                await websocket.send(json.dumps(stats))
-            else:
-                # Frame queued but not processed yet
-                await websocket.send(json.dumps({
-                    'type': 'status',
-                    'message': 'Frame queued for processing',
-                    'queue_position': self.processor.processing_queue.qsize(),
-                    'buffer_fill': len(self.processor.frame_buffer),
-                    'timestamp': time.time()
-                }))
-                
+            # For demo purposes, generate a mock translation
+            if detection_data['confidence'] > 0.5:
+                translation = await self.generate_mock_translation(detection_data, mode)
+                if translation:
+                    translation_response = {
+                        'type': 'translation',
+                        'data': translation,
+                        'detection': detection_data,
+                        'timestamp': time.time(),
+                        'frame_id': data.get('frame_id', 'unknown')
+                    }
+                    await websocket.send(json.dumps(translation_response))
+            
+            # Send stats
+            stats = {
+                'type': 'stats',
+                'fps': self.frame_rate,
+                'hand_count': detection_data['handCount'],
+                'lip_detected': detection_data['lipDetected'],
+                'confidence': detection_data['confidence'],
+                'timestamp': time.time()
+            }
+            await websocket.send(json.dumps(stats))
+            
         except Exception as e:
             print(f"Frame processing error for {client_id}: {e}")
             traceback.print_exc()
@@ -202,6 +316,31 @@ class WebSocketServer:
                 'timestamp': time.time()
             }
             await websocket.send(json.dumps(error_response))
+    
+    async def generate_mock_translation(self, detection_data, mode):
+        """Generate mock translation for demo purposes"""
+        malayalam_chars = "അആഇഈഉഊഋഌഎഏഐഒഓഔകഖഗഘങചഛജഝഞടഠഡഢണതഥദധനപഫബഭമയരലവശഷസഹളഴറ"
+        
+        # Simple logic based on detection
+        if mode == 'sign' and detection_data['handCount'] > 0:
+            char_index = min(detection_data['handCount'] - 1, len(malayalam_chars) - 1)
+        elif mode == 'lip' and detection_data['lipDetected']:
+            char_index = len(malayalam_chars) // 2
+        elif mode == 'both' and (detection_data['handCount'] > 0 or detection_data['lipDetected']):
+            char_index = min(detection_data['handCount'] + (1 if detection_data['lipDetected'] else 0), 
+                           len(malayalam_chars) - 1)
+        else:
+            return None
+        
+        char = malayalam_chars[char_index] if char_index < len(malayalam_chars) else "അ"
+        
+        return {
+            'character': char,
+            'confidence': detection_data['confidence'],
+            'type': mode,
+            'timestamp': time.time(),
+            'processing_time': 0.1
+        }
     
     async def change_mode(self, websocket, client_id, data):
         """Change processing mode"""
@@ -230,7 +369,7 @@ class WebSocketServer:
                 'command': 'start',
                 'status': 'started',
                 'timestamp': time.time(),
-                'message': 'Processing started'
+                'message': 'Detection started'
             }
         elif command == 'stop':
             response = {
@@ -238,7 +377,7 @@ class WebSocketServer:
                 'command': 'stop',
                 'status': 'stopped',
                 'timestamp': time.time(),
-                'message': 'Processing stopped'
+                'message': 'Detection stopped'
             }
         elif command == 'pause':
             response = {
@@ -246,7 +385,7 @@ class WebSocketServer:
                 'command': 'pause',
                 'status': 'paused',
                 'timestamp': time.time(),
-                'message': 'Processing paused'
+                'message': 'Detection paused'
             }
         elif command == 'resume':
             response = {
@@ -254,7 +393,7 @@ class WebSocketServer:
                 'command': 'resume',
                 'status': 'resumed',
                 'timestamp': time.time(),
-                'message': 'Processing resumed'
+                'message': 'Detection resumed'
             }
         else:
             response = {
@@ -276,48 +415,45 @@ class WebSocketServer:
                 except:
                     disconnected.append(connection)
             
-            # Remove disconnected clients
             for connection in disconnected:
                 self.connections.remove(connection)
     
     async def health_check(self):
         """Periodic health check"""
         while True:
-            await asyncio.sleep(30)  # Every 30 seconds
+            await asyncio.sleep(30)
             health_msg = {
                 'type': 'health',
                 'timestamp': time.time(),
                 'connections': len(self.connections),
-                'queue_size': self.processor.processing_queue.qsize(),
-                'status': 'healthy'
+                'status': 'healthy',
+                'detection_active': True
             }
             await self.broadcast(json.dumps(health_msg))
     
     async def start(self, host='0.0.0.0', port=8765):
         """Start WebSocket server"""
         print("=" * 60)
-        print("Malayalam Sign Language & Lip Reading Server")
+        print("Sign Language Detection Server")
         print(f"WebSocket Server starting on {host}:{port}")
         print("=" * 60)
-        print(f"TensorFlow Version: {self.processor.sign_model.__class__.__name__}")
-        print(f"Frame Buffer Size: {self.processor.frame_buffer.maxlen}")
-        print(f"Processing Queue Size: {self.processor.processing_queue.maxsize}")
+        print("Features:")
+        print("  • Real-time hand landmark detection")
+        print("  • Lip movement tracking")
+        print("  • Bounding box visualization")
+        print("  • Confidence scoring")
         print("=" * 60)
         print("Waiting for connections...")
         
-        # Start health check task
         health_task = asyncio.create_task(self.health_check())
         
-        # Start WebSocket server
         async with websockets.serve(self.handle_connection, host, port):
             print(f"✓ Server started successfully on {host}:{port}")
             print("Press Ctrl+C to stop")
-            await asyncio.Future()  # Run forever
+            await asyncio.Future()
         
-        # Cancel health task when server stops
         health_task.cancel()
 
-# Simplified server runner
 def run_server():
     server = WebSocketServer()
     

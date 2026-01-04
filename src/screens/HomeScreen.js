@@ -13,7 +13,6 @@ import {
   Platform,
   StatusBar,
   AppState,
-  TextInput,
   ActivityIndicator,
   Modal,
 } from 'react-native';
@@ -23,7 +22,6 @@ import colors from '../constants/colors';
 import CameraFullScreen from './CameraFullScreen';
 import WebSocketService from '../services/WebSocketService';
 import CameraService from '../services/CameraService';
-
 
 const { width, height } = Dimensions.get('window');
 
@@ -39,17 +37,22 @@ export default function HomeScreen({ navigation }) {
     accuracy: '0%',
     wordsProcessed: 0,
     fps: 0,
+    handCount: 0,
+    lipDetected: false,
   });
   const [cameraActive, setCameraActive] = useState(true);
   const [showCameraFullScreen, setShowCameraFullScreen] = useState(false);
+const [cameraTranslationText, setCameraTranslationText] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
-  const [serverIp, setServerIp] = useState('192.168.1.9'); // Default IP
+  const [serverIp, setServerIp] = useState('192.168.1.9');
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [lastError, setLastError] = useState('');
   const [cameraPermission, setCameraPermission] = useState(null);
   const [showPermissionDialog, setShowPermissionDialog] = useState(false);
+  const [detectionData, setDetectionData] = useState(null);
+  const [translationResult, setTranslationResult] = useState(null);
 
   // Refs
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -74,6 +77,8 @@ export default function HomeScreen({ navigation }) {
     WebSocketService.setOnConnected(handleConnected);
     WebSocketService.setOnDisconnected(handleDisconnected);
     WebSocketService.setOnConnecting(handleConnecting);
+    WebSocketService.setOnDetection(handleDetection);
+    WebSocketService.setOnControlResponse(handleControlResponse);
     
     // Handle app state changes
     const subscription = AppState.addEventListener('change', handleAppStateChange);
@@ -87,37 +92,81 @@ export default function HomeScreen({ navigation }) {
     };
   }, []);
 
-// In HomeScreen.js, update the checkCameraPermission function
-const checkCameraPermission = async () => {
-  try {
-    console.log('Checking camera permission...');
-    
-    // First check if permission is already requested
-    if (!CameraService.permissionRequested) {
-      console.log('Permission not requested yet, requesting...');
-      const granted = await CameraService.initialize();
-      setCameraPermission(granted);
-      setCameraActive(granted);
-      
-      if (!granted) {
-        // Show custom permission request with explanation
-        setTimeout(() => {
-          setShowPermissionDialog(true);
-        }, 1000);
+  const checkCameraPermission = async () => {
+    try {
+      if (!CameraService.permissionRequested) {
+        const granted = await CameraService.initialize();
+        setCameraPermission(granted);
+        setCameraActive(granted);
+        
+        if (!granted) {
+          setTimeout(() => {
+            setShowPermissionDialog(true);
+          }, 1000);
+        }
+      } else {
+        const hasPermission = await CameraService.checkPermission();
+        setCameraPermission(hasPermission);
+        setCameraActive(hasPermission);
       }
-    } else {
-      // Already requested, check current status
-      const hasPermission = await CameraService.checkPermission();
-      console.log('Permission status from check:', hasPermission);
-      setCameraPermission(hasPermission);
-      setCameraActive(hasPermission);
+    } catch (error) {
+      console.error('Error checking permission:', error);
+      setCameraPermission(false);
+      setCameraActive(false);
     }
-  } catch (error) {
-    console.error('Error checking permission:', error);
-    setCameraPermission(false);
-    setCameraActive(false);
+  };
+
+const handleDetection = (data) => {
+  console.log('Detection data received:', {
+    type: data.type,
+    detection: data.detection,
+    hasTranslation: !!data.data
+  });
+
+  if (data.detection) {
+    setDetectionData(data.detection);
+    
+    // Update stats with detection info
+    setProcessingStats(prev => ({
+      ...prev,
+      handCount: data.detection.handCount || 0,
+      lipDetected: data.detection.lipDetected || false,
+      accuracy: `${Math.round((data.detection.confidence || 0) * 100)}%`
+    }));
+  }
+
+  // Handle translation if available
+  if (data.data?.character) {
+    setLiveTranslation(prev => prev + data.data.character);
+    setTranslationResult(data.data);
+    
+    // Update translation buffer for full-screen camera
+    setCameraTranslationText(prev => prev + data.data.character);
+    
+    const historyItem = {
+      id: Date.now().toString(),
+      text: data.data.character,
+      mode: data.data.type || translationMode,
+      timestamp: new Date().toLocaleTimeString(),
+      confidence: Math.round((data.data.confidence || 0.5) * 100),
+      processingTime: data.data.processing_time?.toFixed(2) || '0.00',
+    };
+    
+    setTranslationHistory(prev => [historyItem, ...prev.slice(0, 9)]);
+    
+    setIsProcessing(true);
+    setTimeout(() => setIsProcessing(false), 300);
   }
 };
+  const handleControlResponse = (data) => {
+    console.log('Control response:', data);
+    if (data.command === 'start' && data.status === 'started') {
+      setIsProcessing(true);
+    } else if (data.command === 'stop' && data.status === 'stopped') {
+      setIsProcessing(false);
+    }
+  };
+
   const requestCameraPermission = async () => {
     try {
       const granted = await CameraService.initialize();
@@ -125,7 +174,6 @@ const checkCameraPermission = async () => {
       setCameraActive(granted);
       
       if (!granted) {
-        // Show custom permission request with explanation
         setShowPermissionDialog(true);
       }
     } catch (error) {
@@ -135,51 +183,49 @@ const checkCameraPermission = async () => {
     }
   };
 
-const handleRequestCameraPermission = async () => {
-  setShowPermissionDialog(false);
-  const granted = await CameraService.requestPermissionWithExplanation();
-  setCameraPermission(granted);
-  setCameraActive(granted);
-  
-  if (granted) {
-    Alert.alert(
-      'Camera Enabled',
-      'Camera permission granted. You can now use the full-screen camera.',
-      [{ text: 'OK' }]
-    );
-  } else {
-    // If permission still denied, show option to open settings
-    Alert.alert(
-      'Camera Permission Denied',
-      'To use camera features, you need to enable camera permission in your device settings.',
-      [
-        { 
-          text: 'Open Settings', 
-          onPress: () => {
-            if (Platform.OS === 'ios') {
-              Linking.openURL('app-settings:');
-            } else {
-              Linking.openSettings();
+  const handleRequestCameraPermission = async () => {
+    setShowPermissionDialog(false);
+    const granted = await CameraService.requestPermissionWithExplanation();
+    setCameraPermission(granted);
+    setCameraActive(granted);
+    
+    if (granted) {
+      Alert.alert(
+        'Camera Enabled',
+        'Camera permission granted. You can now use the full-screen camera.',
+        [{ text: 'OK' }]
+      );
+    } else {
+      Alert.alert(
+        'Camera Permission Denied',
+        'To use camera features, you need to enable camera permission in your device settings.',
+        [
+          { 
+            text: 'Open Settings', 
+            onPress: () => {
+              if (Platform.OS === 'ios') {
+                Linking.openURL('app-settings:');
+              } else {
+                Linking.openSettings();
+              }
             }
+          },
+          { 
+            text: 'Cancel', 
+            style: 'cancel' 
           }
-        },
-        { 
-          text: 'Cancel', 
-          style: 'cancel' 
-        }
-      ]
-    );
-  }
-};
+        ]
+      );
+    }
+  };
+
   const initializeServices = async () => {
     try {
-      // Load saved server IP
       const savedIp = await loadServerIp();
       if (savedIp) {
         setServerIp(savedIp);
       }
       
-      // Attempt connection
       await attemptConnection();
       
     } catch (error) {
@@ -212,7 +258,6 @@ const handleRequestCameraPermission = async () => {
       setLastError(error.message);
       setConnectionStatus('disconnected');
       
-      // Show error alert with retry option
       Alert.alert(
         'Connection Failed',
         `Could not connect to server at ${serverIp}:8765\n\nError: ${error.message}\n\nPlease check:\n1. Server is running\n2. Correct IP address\n3. Both devices on same WiFi`,
@@ -266,7 +311,6 @@ const handleRequestCameraPermission = async () => {
       );
     }
     
-    // Auto-reconnect after delay
     reconnectTimeout.current = setTimeout(() => {
       if (!isConnected) {
         console.log('Attempting auto-reconnect...');
@@ -285,32 +329,28 @@ const handleRequestCameraPermission = async () => {
 
   const handleTranslation = (data) => {
     if (data.character) {
-      // Add character to buffer
       translationBuffer.current += data.character;
       
-      // Update live translation
       setLiveTranslation(prev => prev + data.character);
+      setTranslationResult(data);
       
-      // Add to history
       const historyItem = {
         id: Date.now().toString(),
         text: data.character,
-        mode: data.type,
+        mode: data.type || translationMode,
         timestamp: new Date().toLocaleTimeString(),
-        confidence: Math.round(data.confidence * 100),
+        confidence: Math.round((data.confidence || 0.5) * 100),
         processingTime: data.processing_time?.toFixed(2) || '0.00',
       };
       
       setTranslationHistory(prev => [historyItem, ...prev.slice(0, 9)]);
       
-      // Update stats
       setProcessingStats(prev => ({
         ...prev,
-        accuracy: `${Math.round(data.confidence * 100)}%`,
+        accuracy: `${Math.round((data.confidence || 0.5) * 100)}%`,
         wordsProcessed: prev.wordsProcessed + 1,
       }));
 
-      // Trigger processing animation
       setIsProcessing(true);
       setTimeout(() => setIsProcessing(false), 300);
     }
@@ -319,8 +359,8 @@ const handleRequestCameraPermission = async () => {
   const handleStats = (stats) => {
     setProcessingStats(prev => ({
       ...prev,
-      latency: `${Math.round(stats.latency * 1000)}ms`,
-      fps: stats.fps,
+      latency: `${Math.round((stats.latency || 0) * 1000)}ms`,
+      fps: stats.fps || 0,
     }));
   };
 
@@ -329,70 +369,79 @@ const handleRequestCameraPermission = async () => {
     setLastError(error);
   };
 
-  const startStreaming = () => {
-    if (!isConnected) {
-      Alert.alert('Not Connected', 'Please connect to processing server first');
-      return;
-    }
+// In HomeScreen.js, update the startStreaming function
+const startStreaming = () => {
+  if (!isConnected) {
+    Alert.alert('Not Connected', 'Please connect to processing server first');
+    return;
+  }
 
-    if (!cameraPermission) {
-      Alert.alert(
-        'Camera Permission Required',
-        'Please enable camera permission to start translation.',
-        [
-          { text: 'Enable Camera', onPress: requestCameraPermission },
-          { text: 'Cancel', style: 'cancel' }
-        ]
-      );
-      return;
-    }
+  if (!cameraPermission) {
+    Alert.alert(
+      'Camera Permission Required',
+      'Please enable camera permission to start translation.',
+      [
+        { text: 'Enable Camera', onPress: requestCameraPermission },
+        { text: 'Cancel', style: 'cancel' }
+      ]
+    );
+    return;
+  }
 
-    // Start pulse animation for recording indicator
-    Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, {
-          toValue: 1.2,
-          duration: 800,
-          useNativeDriver: true,
-        }),
-        Animated.timing(pulseAnim, {
-          toValue: 1,
-          duration: 800,
-          useNativeDriver: true,
-        }),
-      ])
-    ).start();
+  // Start pulse animation for recording indicator
+  Animated.loop(
+    Animated.sequence([
+      Animated.timing(pulseAnim, {
+        toValue: 1.2,
+        duration: 800,
+        useNativeDriver: true,
+      }),
+      Animated.timing(pulseAnim, {
+        toValue: 1,
+        duration: 800,
+        useNativeDriver: true,
+      }),
+    ])
+  ).start();
 
-    statsRef.current = {
-      startTime: Date.now(),
-      frameCount: 0,
-      totalLatency: 0,
-    };
-
-    CameraService.startStreaming(async (frameBase64) => {
-      if (WebSocketService.isConnected) {
-        WebSocketService.sendFrame(frameBase64, translationMode);
-        statsRef.current.frameCount++;
-        
-        // Update FPS in stats
-        const duration = (Date.now() - statsRef.current.startTime) / 1000;
-        const currentFPS = statsRef.current.frameCount / duration;
-        setProcessingStats(prev => ({
-          ...prev,
-          fps: Math.round(currentFPS),
-        }));
-      }
-    }, 15);
-
-    WebSocketService.sendControl('start');
+  statsRef.current = {
+    startTime: Date.now(),
+    frameCount: 0,
+    totalLatency: 0,
   };
+
+  // Start camera streaming
+  CameraService.startStreaming(
+    (frameBase64) => {
+      // This callback is called for each frame sent
+      statsRef.current.frameCount++;
+      
+      // Update FPS in stats
+      const duration = (Date.now() - statsRef.current.startTime) / 1000;
+      const currentFPS = Math.round(statsRef.current.frameCount / duration);
+      
+      setProcessingStats(prev => ({
+        ...prev,
+        fps: currentFPS,
+        wordsProcessed: statsRef.current.frameCount,
+      }));
+    },
+    15, // Frame rate
+    translationMode // Mode
+  );
+
+  // Send control command to server
+  WebSocketService.sendControl('start');
+  
+  console.log('Streaming started to server');
+};
+
 
   const stopStreaming = () => {
     CameraService.stopStreaming();
     WebSocketService.sendControl('stop');
     pulseAnim.stopAnimation();
     
-    // Calculate final stats
     const duration = (Date.now() - statsRef.current.startTime) / 1000;
     const avgFPS = statsRef.current.frameCount / duration;
     
@@ -402,50 +451,53 @@ const handleRequestCameraPermission = async () => {
     }));
   };
 
-  const startTranslation = () => {
-    if (!isConnected) {
-      Alert.alert('Not Connected', 'Please wait for server connection');
-      return;
-    }
+// Also update the startTranslation function
+const startTranslation = () => {
+  if (!isConnected) {
+    Alert.alert('Not Connected', 'Please wait for server connection');
+    return;
+  }
 
-    if (!cameraPermission) {
-      Alert.alert(
-        'Camera Required',
-        'Please enable camera permission for translation',
-        [
-          { text: 'Enable Camera', onPress: requestCameraPermission },
-          { text: 'Cancel', style: 'cancel' }
-        ]
-      );
-      return;
-    }
+  if (!cameraPermission) {
+    Alert.alert(
+      'Camera Required',
+      'Please enable camera permission for translation',
+      [
+        { text: 'Enable Camera', onPress: requestCameraPermission },
+        { text: 'Cancel', style: 'cancel' }
+      ]
+    );
+    return;
+  }
 
-    setIsRecording(true);
-    setIsTranslating(true);
-    setLiveTranslation('');
-    translationBuffer.current = '';
-    
-    // Button press animation
-    Animated.sequence([
-      Animated.timing(translateBtnScale, {
-        toValue: 0.95,
-        duration: 100,
-        useNativeDriver: true,
-      }),
-      Animated.spring(translateBtnScale, {
-        toValue: 1,
-        tension: 50,
-        friction: 7,
-        useNativeDriver: true,
-      }),
-    ]).start();
+  setIsRecording(true);
+  setIsTranslating(true);
+  setLiveTranslation('');
+  translationBuffer.current = '';
+  
+  // Button press animation
+  Animated.sequence([
+    Animated.timing(translateBtnScale, {
+      toValue: 0.95,
+      duration: 100,
+      useNativeDriver: true,
+    }),
+    Animated.spring(translateBtnScale, {
+      toValue: 1,
+      tension: 50,
+      friction: 7,
+      useNativeDriver: true,
+    }),
+  ]).start();
 
-    startStreaming();
-  };
+  startStreaming();
+};
 
   const stopTranslation = () => {
     setIsRecording(false);
     setIsTranslating(false);
+    setIsProcessing(false);
+    setDetectionData(null);
     stopStreaming();
   };
 
@@ -461,11 +513,15 @@ const handleRequestCameraPermission = async () => {
     setLiveTranslation('');
     setTranslationHistory([]);
     translationBuffer.current = '';
+    setDetectionData(null);
+    setTranslationResult(null);
     setProcessingStats({
       latency: '0ms',
       accuracy: '0%',
       wordsProcessed: 0,
       fps: 0,
+      handCount: 0,
+      lipDetected: false,
     });
   };
 
@@ -481,6 +537,7 @@ const handleRequestCameraPermission = async () => {
     
     setTranslationMode(mode);
     setLiveTranslation('');
+    setDetectionData(null);
     WebSocketService.changeMode(mode);
   };
 
@@ -577,11 +634,26 @@ const handleRequestCameraPermission = async () => {
     return colors.danger;
   };
 
+  const getDetectionStatus = () => {
+    if (!detectionData) return 'Waiting for detection...';
+    
+    let status = [];
+    if (detectionData.handCount > 0) {
+      status.push(`${detectionData.handCount} hand${detectionData.handCount > 1 ? 's' : ''}`);
+    }
+    if (detectionData.lipDetected) {
+      status.push('lips');
+    }
+    
+    return status.length > 0 
+      ? `Detected: ${status.join(', ')}` 
+      : 'No detection';
+  };
+
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
       <StatusBar backgroundColor="#FFFFFF" barStyle="dark-content" />
       
-      {/* Connection Status Bar */}
       <View style={[
         styles.connectionBar, 
         { backgroundColor: `${getConnectionStatusColor()}15` }
@@ -610,7 +682,7 @@ const handleRequestCameraPermission = async () => {
         ) : (
           <Text style={styles.connectionSubtext}>
             {isConnected 
-              ? 'Real-time processing active' 
+              ? 'Real-time detection active' 
               : isConnecting
                 ? 'Attempting to connect...'
                 : 'Tap "Change IP" to update server address'}
@@ -618,7 +690,6 @@ const handleRequestCameraPermission = async () => {
         )}
       </View>
       
-      {/* Header */}
       <View style={styles.header}>
         <View>
           <Text style={styles.appName}>SWARAM</Text>
@@ -650,7 +721,6 @@ const handleRequestCameraPermission = async () => {
         showsVerticalScrollIndicator={false}
         contentContainerStyle={styles.scrollContent}
       >
-        {/* Camera Preview Area */}
         <View style={styles.cameraSection}>
           {cameraPermission === false ? (
             <TouchableOpacity 
@@ -698,7 +768,6 @@ const handleRequestCameraPermission = async () => {
                      '🤟👄 Hybrid Mode'}
                   </Text>
                   
-                  {/* Connection Status */}
                   <View style={styles.cameraStatus}>
                     <View style={styles.statusIndicator}>
                       <View style={[
@@ -709,23 +778,29 @@ const handleRequestCameraPermission = async () => {
                         {getConnectionStatusText()}
                       </Text>
                     </View>
+                    
+                    {detectionData && (
+                      <Text style={styles.detectionText}>
+                        {getDetectionStatus()}
+                      </Text>
+                    )}
+                    
                     {isProcessing && (
                       <Text style={styles.processingText}>Processing...</Text>
                     )}
                   </View>
                   
-                  {/* Instructions */}
                   <Text style={styles.cameraHint}>
                     {isTranslating 
-                      ? 'Recording... Make clear signs/lip movements'
-                      : 'Tap to open full-screen camera'}
+                      ? 'Real-time detection active. Make clear signs/lip movements'
+                      : 'Tap to open full-screen camera with detection overlay'}
                   </Text>
                 </>
               ) : (
                 <>
                   <Text style={styles.cameraEnableText}>Camera Ready</Text>
                   <Text style={styles.cameraHint}>
-                    {isConnected ? 'Tap to open full screen' : 'Connect to server first'}
+                    {isConnected ? 'Tap to open full screen with detection' : 'Connect to server first'}
                   </Text>
                 </>
               )}
@@ -739,7 +814,6 @@ const handleRequestCameraPermission = async () => {
             </TouchableOpacity>
           )}
           
-          {/* Mode Selection */}
           <View style={styles.modeContainer}>
             <Text style={styles.modeLabel}>Translation Mode:</Text>
             <View style={styles.modeChips}>
@@ -750,7 +824,6 @@ const handleRequestCameraPermission = async () => {
           </View>
         </View>
 
-        {/* Live Translation Card */}
         <Card style={styles.liveCard}>
           <Card.Content>
             <View style={styles.liveCardHeader}>
@@ -773,6 +846,16 @@ const handleRequestCameraPermission = async () => {
                   <Text style={styles.liveTranslationText}>
                     {liveTranslation}
                   </Text>
+                  {translationResult && (
+                    <View style={styles.translationMeta}>
+                      <Text style={styles.translationMetaText}>
+                        {translationResult.type === 'sign' ? '🤟 Sign Language' : 
+                         translationResult.type === 'lip' ? '👄 Lip Reading' : 
+                         '🤟👄 Hybrid'} 
+                        {' • '}Confidence: {Math.round((translationResult.confidence || 0) * 100)}%
+                      </Text>
+                    </View>
+                  )}
                 </ScrollView>
               ) : (
                 <Text style={styles.placeholderText}>
@@ -786,7 +869,6 @@ const handleRequestCameraPermission = async () => {
                 </Text>
               )}
               
-              {/* Processing Indicator */}
               {isTranslating && (
                 <View style={styles.modelIndicator}>
                   <Text style={styles.modelText}>
@@ -803,7 +885,6 @@ const handleRequestCameraPermission = async () => {
           </Card.Content>
         </Card>
 
-        {/* Main Control Button */}
         <Animated.View style={{ transform: [{ scale: translateBtnScale }] }}>
           <TouchableOpacity
             style={[
@@ -845,7 +926,6 @@ const handleRequestCameraPermission = async () => {
           </TouchableOpacity>
         </Animated.View>
 
-        {/* Performance Stats */}
         <Card style={styles.statsCard}>
           <Card.Content>
             <Text style={styles.statsTitle}>📊 REAL-TIME PROCESSING STATS</Text>
@@ -863,6 +943,11 @@ const handleRequestCameraPermission = async () => {
               <View style={styles.statItem}>
                 <Text style={styles.statValue}>{processingStats.wordsProcessed}</Text>
                 <Text style={styles.statLabel}>Characters</Text>
+              </View>
+              <View style={styles.statDivider} />
+              <View style={styles.statItem}>
+                <Text style={styles.statValue}>{processingStats.handCount}</Text>
+                <Text style={styles.statLabel}>Hands</Text>
               </View>
             </View>
             <View style={styles.serverContainer}>
@@ -883,7 +968,6 @@ const handleRequestCameraPermission = async () => {
           </Card.Content>
         </Card>
 
-        {/* Recent Translations */}
         {translationHistory.length > 0 && (
           <Card style={styles.historyCard}>
             <Card.Content>
@@ -914,36 +998,34 @@ const handleRequestCameraPermission = async () => {
           </Card>
         )}
 
-        {/* Info Section */}
         <View style={styles.infoSection}>
-          <Text style={styles.infoTitle}>ℹ️ REAL-TIME PROCESSING</Text>
+          <Text style={styles.infoTitle}>ℹ️ REAL-TIME DETECTION FEATURES</Text>
           <View style={styles.infoGrid}>
             <View style={styles.infoItem}>
               <Text style={styles.infoIcon}>🤟</Text>
-              <Text style={styles.infoItemTitle}>Sign Detection</Text>
+              <Text style={styles.infoItemTitle}>Hand Detection</Text>
               <Text style={styles.infoItemText}>
-                3D CNN processes hand gestures in real-time via WebSocket
+                Real-time hand landmark detection with visual overlay
               </Text>
             </View>
             <View style={styles.infoItem}>
               <Text style={styles.infoIcon}>👄</Text>
-              <Text style={styles.infoItemTitle}>Lip Reading</Text>
+              <Text style={styles.infoItemTitle}>Lip Detection</Text>
               <Text style={styles.infoItemText}>
-                BiLSTM analyzes lip movements with server-side processing
+                Lip movement tracking with bounding box visualization
               </Text>
             </View>
             <View style={styles.infoItem}>
               <Text style={styles.infoIcon}>⚡</Text>
-              <Text style={styles.infoItemTitle}>WebSocket Stream</Text>
+              <Text style={styles.infoItemTitle}>Real-time Overlay</Text>
               <Text style={styles.infoItemText}>
-                15 FPS streaming to Python server for real-time analysis
+                Visual feedback showing detection landmarks and confidence
               </Text>
             </View>
           </View>
         </View>
       </ScrollView>
 
-      {/* Bottom Status Bar */}
       <View style={styles.statusBar}>
         <View style={styles.statusItem}>
           <View style={[
@@ -962,30 +1044,32 @@ const handleRequestCameraPermission = async () => {
         </View>
         <View style={styles.statusDivider} />
         <View style={styles.statusItem}>
-          <View style={[
-            styles.statusDot, 
-            { backgroundColor: getCameraPermissionColor() }
-          ]} />
           <Text style={styles.statusText}>
-            {getCameraPermissionText()}
+            {detectionData ? `🤟 ${detectionData.handCount || 0}` : '🤟 0'}
           </Text>
         </View>
       </View>
 
-      {/* Camera Full Screen Modal */}
-      <CameraFullScreen
-        visible={showCameraFullScreen}
-        onClose={() => {
-          setShowCameraFullScreen(false);
-          if (isRecording) stopTranslation();
-        }}
-        translationMode={translationMode}
-        isTranslating={isTranslating}
-        hasCameraPermission={cameraPermission}
-        onPermissionRequest={requestCameraPermission}
-      />
+<CameraFullScreen
+  visible={showCameraFullScreen}
+  onClose={() => {
+    setShowCameraFullScreen(false);
+    setDetectionData(null);
+    setCameraTranslationText('');
+    if (isRecording) stopTranslation();
+  }}
+  translationMode={translationMode}
+  isTranslating={isRecording} // Use isRecording state
+  detectionData={detectionData}
+  translationText={cameraTranslationText}
+  onStartRecording={startTranslation}
+  onStopRecording={stopTranslation}
+    onCameraReady={(cameraRef) => {
+    // Set camera ref in CameraService
+    CameraService.setCameraRef(cameraRef);
+  }}
+/>
 
-      {/* Camera Permission Dialog */}
       <Modal
         visible={showPermissionDialog}
         transparent={true}
@@ -1210,6 +1294,12 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: colors.textSecondary,
   },
+  detectionText: {
+    fontSize: 12,
+    color: colors.success,
+    fontWeight: '500',
+    marginBottom: 5,
+  },
   processingText: {
     fontSize: 12,
     color: colors.primary,
@@ -1314,6 +1404,18 @@ const styles = StyleSheet.create({
     fontSize: 20,
     color: colors.textPrimary,
     lineHeight: 28,
+    textAlign: 'center',
+    paddingVertical: 10,
+  },
+  translationMeta: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#EAEFFF',
+  },
+  translationMetaText: {
+    fontSize: 12,
+    color: colors.textSecondary,
     textAlign: 'center',
   },
   placeholderText: {
