@@ -23,16 +23,16 @@ class RealTimeDetector:
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.5,  # Lowered for better detection
+            min_tracking_confidence=0.3    # Lowered for better tracking
         )
         
         # Face mesh for lip detection
         self.face_mesh = self.mp_face_mesh.FaceMesh(
             static_image_mode=False,
             max_num_faces=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.3,  # Lowered for better detection
+            min_tracking_confidence=0.3    # Lowered for better tracking
         )
         
         self.executor = ThreadPoolExecutor(max_workers=4)
@@ -72,6 +72,21 @@ class RealTimeDetector:
         }
         
         try:
+            # Preprocess image for better detection
+            # Resize if too large (maintain aspect ratio)
+            height, width = frame.shape[:2]
+            if width > 640:
+                aspect_ratio = height / width
+                new_width = 640
+                new_height = int(new_width * aspect_ratio)
+                frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+            
+            # Enhance contrast slightly
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+            
             # Convert BGR to RGB
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image_rgb.flags.writeable = False

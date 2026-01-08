@@ -18,6 +18,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Card, IconButton, ProgressBar, Chip } from 'react-native-paper';
+import { Audio } from 'expo-audio';
 import colors from '../constants/colors';
 import CameraFullScreen from './CameraFullScreen';
 import WebSocketService from '../services/WebSocketService';
@@ -46,13 +47,14 @@ const [cameraTranslationText, setCameraTranslationText] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
-  const [serverIp, setServerIp] = useState('192.168.1.9');
+  const [serverIp, setServerIp] = useState('192.168.207.170');
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [lastError, setLastError] = useState('');
   const [cameraPermission, setCameraPermission] = useState(null);
   const [showPermissionDialog, setShowPermissionDialog] = useState(false);
   const [detectionData, setDetectionData] = useState(null);
   const [translationResult, setTranslationResult] = useState(null);
+  const [cameraReady, setCameraReady] = useState(false);
 
   // Refs
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -328,18 +330,28 @@ const handleDetection = (data) => {
   };
 
   const handleTranslation = (data) => {
-    if (data.character) {
-      translationBuffer.current += data.character;
+    console.log('Translation received:', data);
+    if (data.data?.text) {
+      const translationText = data.data.text;
+      translationBuffer.current += translationText;
       
-      setLiveTranslation(prev => prev + data.character);
-      setTranslationResult(data);
+      setLiveTranslation(prev => prev + translationText);
+      setTranslationResult(data.data);
+      
+      // Play audio if available
+      if (data.audio) {
+        console.log('Playing audio:', data.audio);
+        playAudio(data.audio);
+      } else {
+        console.log('No audio data in translation');
+      }
       
       const historyItem = {
         id: Date.now().toString(),
-        text: data.character,
-        mode: data.type || translationMode,
+        text: translationText,
+        mode: data.data.type || translationMode,
         timestamp: new Date().toLocaleTimeString(),
-        confidence: Math.round((data.confidence || 0.5) * 100),
+        confidence: Math.round((data.data.confidence || 0.5) * 100),
         processingTime: data.processing_time?.toFixed(2) || '0.00',
       };
       
@@ -347,7 +359,7 @@ const handleDetection = (data) => {
       
       setProcessingStats(prev => ({
         ...prev,
-        accuracy: `${Math.round((data.confidence || 0.5) * 100)}%`,
+        accuracy: `${Math.round((data.data.confidence || 0.5) * 100)}%`,
         wordsProcessed: prev.wordsProcessed + 1,
       }));
 
@@ -369,6 +381,64 @@ const handleDetection = (data) => {
     setLastError(error);
   };
 
+  const playAudio = async (audioData) => {
+    try {
+      console.log('playAudio called with:', audioData);
+      if (!audioData?.audio) {
+        console.log('No audio data provided');
+        return;
+      }
+
+      console.log('Setting audio mode...');
+      // Set audio mode for playback
+      await Audio.setAudioModeAsync({
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+      });
+
+      console.log('Creating sound object...');
+      // Create sound object from base64 data
+      const soundObject = new Audio.Sound();
+      const uri = `data:audio/mp3;base64,${audioData.audio}`;
+      console.log('Loading audio from URI (first 50 chars):', uri.substring(0, 50));
+      
+      await soundObject.loadAsync({ uri });
+
+      console.log('Playing audio...');
+      // Play the audio
+      await soundObject.playAsync();
+
+      // Unload after playing
+      soundObject.setOnPlaybackStatusUpdate((status) => {
+        console.log('Playback status:', status);
+        if (status.didJustFinish) {
+          console.log('Audio finished playing, unloading...');
+          soundObject.unloadAsync();
+        }
+      });
+
+    } catch (error) {
+      console.error('Audio playback error:', error);
+    }
+  };
+
+  const getLocalIP = () => {
+    // This is a simple way to suggest the local IP
+    // In a real app, you might want to use a network discovery library
+    return '192.168.110.170'; // Current network IP
+  };
+
+  const autoDetectIP = () => {
+    const suggestedIP = getLocalIP();
+    setServerIp(suggestedIP);
+    Alert.alert(
+      'IP Address Detected',
+      `Suggested IP: ${suggestedIP}\n\nMake sure your computer and phone are on the same WiFi network.`,
+      [{ text: 'OK' }]
+    );
+  };
+
 // In HomeScreen.js, update the startStreaming function
 const startStreaming = () => {
   if (!isConnected) {
@@ -385,6 +455,11 @@ const startStreaming = () => {
         { text: 'Cancel', style: 'cancel' }
       ]
     );
+    return;
+  }
+
+  if (!cameraReady) {
+    Alert.alert('Camera Not Ready', 'Please wait for camera to initialize');
     return;
   }
 
@@ -411,24 +486,26 @@ const startStreaming = () => {
   };
 
   // Start camera streaming
-  CameraService.startStreaming(
-    (frameBase64) => {
-      // This callback is called for each frame sent
-      statsRef.current.frameCount++;
-      
-      // Update FPS in stats
-      const duration = (Date.now() - statsRef.current.startTime) / 1000;
-      const currentFPS = Math.round(statsRef.current.frameCount / duration);
-      
-      setProcessingStats(prev => ({
-        ...prev,
-        fps: currentFPS,
-        wordsProcessed: statsRef.current.frameCount,
-      }));
-    },
-    15, // Frame rate
-    translationMode // Mode
-  );
+  setTimeout(() => {
+    CameraService.startStreaming(
+      (frameBase64) => {
+        // This callback is called for each frame sent
+        statsRef.current.frameCount++;
+        
+        // Update FPS in stats
+        const duration = (Date.now() - statsRef.current.startTime) / 1000;
+        const currentFPS = Math.round(statsRef.current.frameCount / duration);
+        
+        setProcessingStats(prev => ({
+          ...prev,
+          fps: currentFPS,
+          wordsProcessed: statsRef.current.frameCount,
+        }));
+      },
+      10, // Reduced frame rate for mobile devices
+      translationMode // Mode
+    );
+  }, 500); // Small delay to ensure camera is ready
 
   // Send control command to server
   WebSocketService.sendControl('start');
@@ -542,23 +619,42 @@ const startTranslation = () => {
   };
 
   const showIpDialog = () => {
-    Alert.prompt(
-      'Change Server IP',
-      'Enter the IP address of your server:',
+    Alert.alert(
+      'Server Connection',
+      `Current IP: ${serverIp}\n\nChoose an option:`,
       [
         { text: 'Cancel', style: 'cancel' },
-        { 
-          text: 'Save', 
-          onPress: (ip) => {
-            if (ip && ip.trim()) {
-              saveServerIp(ip.trim());
-              setTimeout(attemptConnection, 500);
-            }
+        {
+          text: 'Auto Detect',
+          onPress: () => {
+            autoDetectIP();
+            setTimeout(attemptConnection, 500);
+          }
+        },
+        {
+          text: 'Manual Entry',
+          onPress: () => {
+            Alert.prompt(
+              'Enter Server IP',
+              'Enter the IP address of your server:',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Save',
+                  onPress: (ip) => {
+                    if (ip && ip.trim()) {
+                      saveServerIp(ip.trim());
+                      setTimeout(attemptConnection, 500);
+                    }
+                  }
+                }
+              ],
+              'plain-text',
+              serverIp
+            );
           }
         }
-      ],
-      'plain-text',
-      serverIp
+      ]
     );
   };
 
@@ -728,7 +824,7 @@ const startTranslation = () => {
               onPress={requestCameraPermission}
               activeOpacity={0.8}
             >
-              <Text style={styles.permissionIcon}>📷</Text>
+              <Text style={styles.permissionIcon}>CAMERA</Text>
               <Text style={styles.permissionTitle}>Camera Disabled</Text>
               <Text style={styles.permissionText}>
                 Tap to enable camera for sign language translation
@@ -763,9 +859,9 @@ const startTranslation = () => {
                     />
                   )}
                   <Text style={styles.cameraText}>
-                    {translationMode === 'sign' ? '🤟 Sign Language Mode' :
-                     translationMode === 'lip' ? '👄 Lip Reading Mode' :
-                     '🤟👄 Hybrid Mode'}
+                    {translationMode === 'sign' ? 'Sign Language Mode' :
+                     translationMode === 'lip' ? 'Lip Reading Mode' :
+                     'Hybrid Mode'}
                   </Text>
                   
                   <View style={styles.cameraStatus}>
@@ -828,7 +924,7 @@ const startTranslation = () => {
           <Card.Content>
             <View style={styles.liveCardHeader}>
               <Text style={styles.liveCardTitle}>
-                {isTranslating ? '🔄 LIVE TRANSLATION' : '📝 TRANSLATION READY'}
+                {isTranslating ? 'LIVE TRANSLATION' : 'TRANSLATION READY'}
               </Text>
               {liveTranslation ? (
                 <TouchableOpacity onPress={handleClearTranslation}>
@@ -849,9 +945,9 @@ const startTranslation = () => {
                   {translationResult && (
                     <View style={styles.translationMeta}>
                       <Text style={styles.translationMetaText}>
-                        {translationResult.type === 'sign' ? '🤟 Sign Language' : 
-                         translationResult.type === 'lip' ? '👄 Lip Reading' : 
-                         '🤟👄 Hybrid'} 
+                        {translationResult.type === 'sign' ? 'Sign Language' : 
+                         translationResult.type === 'lip' ? 'Lip Reading' : 
+                         'Hybrid'} 
                         {' • '}Confidence: {Math.round((translationResult.confidence || 0) * 100)}%
                       </Text>
                     </View>
@@ -872,7 +968,7 @@ const startTranslation = () => {
               {isTranslating && (
                 <View style={styles.modelIndicator}>
                   <Text style={styles.modelText}>
-                    {isProcessing ? '🔬 Processing Frame...' : '⚡ Ready for next frame'}
+                    {isProcessing ? 'Processing Frame...' : 'Ready for next frame'}
                   </Text>
                   <ProgressBar 
                     progress={isProcessing ? 0.7 : 0} 
@@ -900,7 +996,7 @@ const startTranslation = () => {
               <ActivityIndicator color="#FFFFFF" />
             ) : cameraPermission === false ? (
               <>
-                <Text style={styles.mainButtonText}>📷 ENABLE CAMERA</Text>
+                <Text style={styles.mainButtonText}>ENABLE CAMERA</Text>
                 <Text style={styles.mainButtonSubtext}>
                   Camera permission required to start translation
                 </Text>
@@ -909,10 +1005,10 @@ const startTranslation = () => {
               <>
                 <Text style={styles.mainButtonText}>
                   {!isConnected 
-                    ? '🔌 DISCONNECTED' 
+                    ? 'DISCONNECTED' 
                     : isRecording 
-                      ? '⏸ STOP TRANSLATION' 
-                      : '▶ START TRANSLATION'}
+                      ? 'STOP TRANSLATION' 
+                      : 'START TRANSLATION'}
                 </Text>
                 <Text style={styles.mainButtonSubtext}>
                   {!isConnected
@@ -982,7 +1078,7 @@ const startTranslation = () => {
                       <Text style={styles.historyText}>{item.text}</Text>
                       <View style={styles.historyMeta}>
                         <Text style={styles.historyMetaText}>
-                          {item.mode === 'sign' ? '🤟' : item.mode === 'lip' ? '👄' : '🤟👄'} 
+                          {item.mode === 'sign' ? 'SIGN' : item.mode === 'lip' ? 'LIP' : 'HYBRID'} 
                           {' • '}{item.timestamp}
                           {' • '}{item.processingTime}s
                         </Text>
@@ -1002,14 +1098,14 @@ const startTranslation = () => {
           <Text style={styles.infoTitle}>ℹ️ REAL-TIME DETECTION FEATURES</Text>
           <View style={styles.infoGrid}>
             <View style={styles.infoItem}>
-              <Text style={styles.infoIcon}>🤟</Text>
+              <Text style={styles.infoIcon}>SIGN</Text>
               <Text style={styles.infoItemTitle}>Hand Detection</Text>
               <Text style={styles.infoItemText}>
                 Real-time hand landmark detection with visual overlay
               </Text>
             </View>
             <View style={styles.infoItem}>
-              <Text style={styles.infoIcon}>👄</Text>
+              <Text style={styles.infoIcon}>LIP</Text>
               <Text style={styles.infoItemTitle}>Lip Detection</Text>
               <Text style={styles.infoItemText}>
                 Lip movement tracking with bounding box visualization
@@ -1067,6 +1163,8 @@ const startTranslation = () => {
     onCameraReady={(cameraRef) => {
     // Set camera ref in CameraService
     CameraService.setCameraRef(cameraRef);
+    setCameraReady(true);
+    console.log('Camera is ready for streaming');
   }}
 />
 

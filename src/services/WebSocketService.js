@@ -4,10 +4,11 @@ import { Platform } from 'react-native';
 const SERVER_CONFIG = {
   development: {
     wsUrls: [
-      'ws://10.0.2.2:8765',
-      'ws://localhost:8765',
-      'ws://192.168.1.9:8765',
-      'ws://192.168.196.170:8765',
+      'ws://192.168.207.170:8765',  // Current network IP
+      'ws://10.0.2.2:8765',        // Android emulator
+      'ws://localhost:8765',       // Localhost
+      'ws://192.168.83.170:8765',  // Previous network
+      'ws://192.168.196.170:8765', // Previous network
     ],
     apiUrl: 'http://localhost:5000',
   },

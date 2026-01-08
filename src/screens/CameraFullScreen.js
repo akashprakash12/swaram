@@ -19,6 +19,7 @@ import {
   Camera,
 } from 'expo-camera';
 import colors from '../constants/colors';
+import WebSocketService from '../services/WebSocketService';
 
 const { width, height } = Dimensions.get('window');
 
@@ -31,31 +32,87 @@ const HAND_CONNECTIONS = [
   [0, 17], [17, 18], [18, 19], [19, 20]  // Pinky
 ];
 
+// Camera Controls Component
+const CameraControls = ({ 
+  facing, flash, zoom, torch, 
+  onToggleFacing, onToggleFlash, onToggleTorch, onAdjustZoom 
+}) => {
+  return (
+    <View style={styles.cameraControlsContainer}>
+      {/* Top Controls */}
+      <View style={styles.topControls}>
+        <TouchableOpacity 
+          style={styles.controlButton}
+          onPress={onToggleFlash}
+        >
+          <Text style={styles.controlIcon}>
+            {flash === 'off' ? '⚡' : flash === 'on' ? '⚡' : '🔄'}
+          </Text>
+          <Text style={styles.controlLabel}>
+            {flash === 'off' ? 'Flash Off' : flash === 'on' ? 'Flash On' : 'Auto'}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={styles.controlButton}
+          onPress={onToggleTorch}
+        >
+          <Text style={styles.controlIcon}>
+            {torch ? '🔦' : '💡'}
+          </Text>
+          <Text style={styles.controlLabel}>
+            {torch ? 'Torch On' : 'Torch Off'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Bottom Controls */}
+      <View style={styles.bottomControls}>
+        <TouchableOpacity 
+          style={styles.controlButton}
+          onPress={() => onAdjustZoom('out')}
+        >
+          <Text style={styles.controlIcon}>🔍-</Text>
+          <Text style={styles.controlLabel}>Zoom Out</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={styles.controlButton}
+          onPress={onToggleFacing}
+        >
+          <Text style={styles.controlIcon}>📷</Text>
+          <Text style={styles.controlLabel}>
+            {facing === 'front' ? 'Front' : 'Back'}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity 
+          style={styles.controlButton}
+          onPress={() => onAdjustZoom('in')}
+        >
+          <Text style={styles.controlIcon}>🔍+</Text>
+          <Text style={styles.controlLabel}>Zoom In</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Zoom Indicator */}
+      <View style={styles.zoomIndicator}>
+        <Text style={styles.zoomText}>Zoom: {Math.round(zoom * 100)}%</Text>
+      </View>
+    </View>
+  );
+};
+
 // Detection Overlay Component
 // Updated DetectionOverlay component - FIXED VERSION
 const DetectionOverlay = ({ detectionData, mode, isTranslating, translationText }) => {
-  // Early returns for different states
-  if (!isTranslating) {
-    return (
-      <View style={styles.waitingOverlay}>
-        <Text style={styles.waitingText}>Ready for Detection</Text>
-        <Text style={styles.waitingSubtext}>
-          {mode === 'sign' ? 'Show your hands in the frame' :
-           mode === 'lip' ? 'Face the camera clearly' :
-           'Show hands or face for detection'}
-        </Text>
-        <View style={styles.guideCircle} />
-        <Text style={styles.guideText}>Place here</Text>
-      </View>
-    );
-  }
-
   // Debug logging
   console.log('DetectionOverlay received data:', {
     hasDetection: !!detectionData,
     handLandmarks: detectionData?.handLandmarks?.length || 0,
     lipLandmarks: detectionData?.lipLandmarks?.length || 0,
-    mode: mode
+    mode: mode,
+    isTranslating: isTranslating
   });
 
   // If no detection data yet
@@ -370,212 +427,76 @@ const DetectionInfo = ({ detectionData, translationText, mode }) => {
   );
 };
 // Main CameraFullScreen Component
-export default function CameraFullScreen({ 
-  visible, 
-  onClose, 
+export default function CameraFullScreen({
+  visible,
+  onClose,
   translationMode = 'sign',
   isTranslating = false,
   detectionData = null,
   onStartRecording = () => {},
   onStopRecording = () => {},
   translationText = '',
-  onCameraReady = () => {} 
+  onCameraReady = () => {}
 }) {
-  const [isRecording, setIsRecording] = useState(false);
-  const [flashMode, setFlashMode] = useState('off');
-  const [cameraType, setCameraType] = useState('front');
-  const [zoom, setZoom] = useState(0);
   const [hasPermission, setHasPermission] = useState(null);
   const [cameraReady, setCameraReady] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  
   const cameraRef = useRef(null);
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  const fadeAnim = useRef(new Animated.Value(0)).current;
-  const recordingTime = useRef(0);
-  const recordingInterval = useRef(null);
-  const processingAnim = useRef(new Animated.Value(0)).current;
+
+  // Camera controls state
+  const [facing, setFacing] = useState('front');
+  const [flash, setFlash] = useState('off');
+  const [zoom, setZoom] = useState(0);
+  const [torch, setTorch] = useState(false);
 
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
-  const [microphonePermission, requestMicrophonePermission] = useMicrophonePermissions();
 
   useEffect(() => {
-    if (visible) {
-      // Request permissions if needed
-      if (!cameraPermission?.granted) {
-        requestCameraPermission();
-      }
-      if (!microphonePermission?.granted) {
-        requestMicrophonePermission();
-      }
-      
-      // Fade in animation
-      Animated.timing(fadeAnim, {
-        toValue: 1,
-        duration: 300,
-        useNativeDriver: true,
-      }).start();
-      
-      StatusBar.setHidden(true);
-    } else {
-      StatusBar.setHidden(false);
-      // Clean up
-      if (recordingInterval.current) {
-        clearInterval(recordingInterval.current);
-        recordingInterval.current = null;
-      }
-      
-      if (isRecording) {
-        handleStopRecording();
-      }
+    if (visible && !cameraPermission?.granted) {
+      requestCameraPermission();
     }
-    
-    return () => {
-      StatusBar.setHidden(false);
-    };
-  }, [visible]);
+  }, [visible, cameraPermission]);
 
   useEffect(() => {
-    if (isRecording) {
-      // Start recording timer
-      recordingTime.current = 0;
-      recordingInterval.current = setInterval(() => {
-        recordingTime.current += 1;
-      }, 1000);
+    setHasPermission(cameraPermission?.granted || false);
+  }, [cameraPermission]);
 
-      // Pulse animation for recording indicator
-      Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, {
-            toValue: 1.2,
-            duration: 1000,
-            useNativeDriver: true,
-          }),
-          Animated.timing(pulseAnim, {
-            toValue: 1,
-            duration: 1000,
-            useNativeDriver: true,
-          }),
-        ])
-      ).start();
-    } else {
-      // Stop recording timer
-      if (recordingInterval.current) {
-        clearInterval(recordingInterval.current);
-        recordingInterval.current = null;
-      }
-      pulseAnim.stopAnimation();
-    }
-
+  // Cleanup streaming interval when component unmounts or visibility changes
+  useEffect(() => {
     return () => {
-      if (recordingInterval.current) {
-        clearInterval(recordingInterval.current);
+      if (cameraRef.current && cameraRef.current.streamingInterval) {
+        clearInterval(cameraRef.current.streamingInterval);
+        console.log('Cleaned up streaming interval');
       }
     };
-  }, [isRecording]);
+  }, []);
 
-  useEffect(() => {
-    if (isTranslating) {
-      // Processing animation
-      Animated.loop(
-        Animated.sequence([
-          Animated.timing(processingAnim, {
-            toValue: 1,
-            duration: 500,
-            useNativeDriver: true,
-          }),
-          Animated.timing(processingAnim, {
-            toValue: 0,
-            duration: 500,
-            useNativeDriver: true,
-          }),
-        ])
-      ).start();
-    } else {
-      processingAnim.stopAnimation();
-    }
-  }, [isTranslating]);
-
-  useEffect(() => {
-    if (cameraPermission && microphonePermission) {
-      const granted = cameraPermission.granted && microphonePermission.granted;
-      setHasPermission(granted);
-    }
-  }, [cameraPermission, microphonePermission]);
-
-  const handleStartRecording = () => {
-    setIsRecording(true);
-    setIsProcessing(true);
-    onStartRecording();
+  // Camera control functions
+  const toggleCameraFacing = () => {
+    setFacing(current => (current === 'back' ? 'front' : 'back'));
   };
 
-  const handleStopRecording = () => {
-    setIsRecording(false);
-    setIsProcessing(false);
-    onStopRecording();
+  const toggleFlash = () => {
+    setFlash(current => {
+      if (current === 'off') return 'on';
+      if (current === 'on') return 'auto';
+      return 'off';
+    });
   };
 
-  const handleToggleRecording = () => {
-    if (!isRecording) {
-      handleStartRecording();
-    } else {
-      handleStopRecording();
-    }
+  const toggleTorch = () => {
+    setTorch(current => !current);
   };
 
-  const handleToggleFlash = () => {
-    setFlashMode(prev => prev === 'off' ? 'on' : 'off');
+  const adjustZoom = (direction) => {
+    setZoom(current => {
+      if (direction === 'in' && current < 1) {
+        return Math.min(1, current + 0.1);
+      } else if (direction === 'out' && current > 0) {
+        return Math.max(0, current - 0.1);
+      }
+      return current;
+    });
   };
-
-  const handleToggleCamera = () => {
-    setCameraType(prev => prev === 'front' ? 'back' : 'front');
-  };
-
-  const handleZoomIn = () => {
-    setZoom(prev => Math.min(prev + 0.1, 1));
-  };
-
-  const handleZoomOut = () => {
-    setZoom(prev => Math.max(prev - 0.1, 0));
-  };
-
-  const formatRecordingTime = (seconds) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  };
-
-  const getModeText = () => {
-    switch(translationMode) {
-      case 'sign': return 'Sign Language Mode';
-      case 'lip': return 'Lip Reading Mode';
-      case 'both': return 'Hybrid Mode';
-      default: return 'Camera Mode';
-    }
-  };
-
-  const getModeIcon = () => {
-    switch(translationMode) {
-      case 'sign': return '👐';
-      case 'lip': return '🗣️';
-      case 'both': return '🤝';
-      default: return '📷';
-    }
-  };
-
-  const getFlashIcon = () => {
-    return flashMode === 'on' ? '⚡️' : '⚡️';
-  };
-
-  const getFlashText = () => {
-    return flashMode === 'on' ? 'ON' : 'OFF';
-  };
-
-  const getCameraTypeText = () => {
-    return cameraType === 'front' ? 'Front' : 'Back';
-  };
-
-  const CameraComponent = CameraView || Camera;
 
   if (!visible) return null;
 
@@ -587,260 +508,134 @@ export default function CameraFullScreen({
       hardwareAccelerated
       onRequestClose={onClose}
     >
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={{ flex: 1, backgroundColor: 'black' }}>
         {/* Header */}
-        <View style={styles.header}>
-          <View style={styles.headerLeft}>
-            <IconButton
-              icon="close"
-              size={28}
-              iconColor="#FFFFFF"
-              onPress={onClose}
-              style={styles.closeButton}
-            />
-            <View style={styles.modeBadge}>
-              <Text style={styles.modeIcon}>{getModeIcon()}</Text>
-              <Text style={styles.modeText}>{getModeText()}</Text>
-            </View>
-          </View>
-          
-          <View style={styles.headerRight}>
-            {isRecording && (
-              <Animated.View 
-                style={[
-                  styles.recordingIndicator,
-                  { transform: [{ scale: pulseAnim }] }
-                ]}
-              >
-                <View style={styles.recordingDot} />
-                <Text style={styles.recordingText}>
-                  REC {formatRecordingTime(recordingTime.current)}
-                </Text>
-              </Animated.View>
-            )}
-            
-            {isProcessing && !isRecording && (
-              <View style={styles.processingIndicator}>
-                <ActivityIndicator size="small" color="#FFFFFF" />
-                <Text style={styles.processingText}>Processing...</Text>
-              </View>
-            )}
-          </View>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', padding: 20 }}>
+          <TouchableOpacity onPress={onClose}>
+            <Text style={{ color: 'white', fontSize: 18 }}>✕</Text>
+          </TouchableOpacity>
+          <Text style={{ color: 'white', fontSize: 16 }}>
+            {translationMode === 'sign' ? 'Sign Language' :
+             translationMode === 'lip' ? 'Lip Reading' : 'Hybrid'} Mode
+          </Text>
+          <View style={{ width: 20 }} />
         </View>
 
         {/* Camera Preview Area */}
+        {hasPermission === true ? (
+          <View style={{ flex: 1 }}>
+            <CameraView
+              ref={(ref) => {
+                cameraRef.current = ref;
+                if (ref && onCameraReady) {
+                  onCameraReady(ref);
+                }
+              }}
+              style={{ flex: 1 }}
+              facing={facing}
+              flash={flash}
+              zoom={zoom}
+              enableTorch={torch}
+              onCameraReady={() => {
+                console.log('✓ Camera is ready');
+                setCameraReady(true);
+                
+                // Start streaming for real-time detection overlay
+                // Check if WebSocket is connected and camera is available
+                setTimeout(() => {
+                  if (cameraRef.current && WebSocketService && WebSocketService.isConnected) {
+                    console.log('Starting preview streaming for real-time detection');
+                    
+                    // Start streaming directly with camera ref
+                    const startDirectStreaming = () => {
+                      if (!cameraRef.current) {
+                        console.log('Camera ref not available for streaming');
+                        return;
+                      }
 
-<View style={styles.cameraPreview}>
-  {hasPermission === true ? (
-    <View style={styles.cameraContainer}>
-      <CameraComponent
-           ref={(ref) => {
-      cameraRef.current = ref;
-      // Pass camera ref to parent (HomeScreen)
-      if (ref && onCameraReady) {
-        onCameraReady(ref);
-      }
-    }}
-        style={StyleSheet.absoluteFill}
-        facing={cameraType}
-        flashMode={flashMode}
-        zoom={zoom}
-        onCameraReady={() => {
-          console.log('✓ Camera is ready');
-          setCameraReady(true);
-        }}
-        onError={(error) => {
-          console.error('Camera error:', error);
-          setCameraReady(false);
-        }}
-        mode="video"
-        videoQuality="1080p"
-      />
-      
-      {/* Overlay components */}
-      <DetectionOverlay 
-        detectionData={detectionData}
-        mode={translationMode}
-        isTranslating={isTranslating}
-        translationText={translationText}
-      />
-      
-      {/* Grid Overlay */}
-      <View style={styles.gridOverlay}>
-        <View style={styles.gridLineHorizontal} />
-        <View style={styles.gridLineVertical} />
-        <View style={styles.focusBox} />
-      </View>
-      
-      {/* Mode Indicator */}
-      <View style={styles.modeIndicator}>
-        <Text style={styles.modeIndicatorIcon}>{getModeIcon()}</Text>
-        <Text style={styles.modeIndicatorLabel}>{getModeText()}</Text>
-      </View>
-      
-      {/* Zoom Indicator */}
-      {zoom > 0 && (
-        <View style={styles.zoomIndicator}>
-          <Text style={styles.zoomText}>{Math.round(zoom * 100)}%</Text>
-        </View>
-      )}
-    </View>
-  ) : hasPermission === false ? (
-    <View style={styles.permissionOverlay}>
-      <Text style={styles.permissionTitle}>Camera Permission Required</Text>
-      <Text style={styles.permissionText}>
-        Please enable camera and microphone access in your device settings.
-      </Text>
-      <TouchableOpacity 
-        style={styles.permissionButton}
-        onPress={requestCameraPermission}
-      >
-        <Text style={styles.permissionButtonText}>Grant Permission</Text>
-      </TouchableOpacity>
-    </View>
-  ) : (
-    <View style={styles.permissionOverlay}>
-      <ActivityIndicator size="large" color="#FFFFFF" />
-      <Text style={styles.permissionTitle}>Requesting Permissions...</Text>
-    </View>
-  )}
-</View>
-        {/* Camera Controls */}
-        <View style={styles.controlsContainer}>
-          {/* Left Controls */}
-          <View style={styles.controlGroup}>
-            <TouchableOpacity 
-              style={[
-                styles.controlButton,
-                flashMode === 'on' && styles.controlButtonActive
-              ]}
-              onPress={handleToggleFlash}
-              disabled={!cameraReady || isRecording}
-            >
-              <View style={styles.controlIconContainer}>
-                <Text style={styles.controlButtonIcon}>
-                  {getFlashIcon()}
-                </Text>
-              </View>
-              <Text style={styles.controlButtonText}>
-                {getFlashText()}
-              </Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              style={[
-                styles.controlButton,
-                zoom === 0 && styles.controlButtonDisabled
-              ]}
-              onPress={handleZoomOut}
-              disabled={zoom === 0 || !cameraReady || isRecording}
-            >
-              <View style={styles.controlIconContainer}>
-                <Text style={styles.controlButtonIcon}>-</Text>
-              </View>
-              <Text style={styles.controlButtonText}>Zoom Out</Text>
-            </TouchableOpacity>
+                      console.log('Camera ref available, starting direct streaming');
+                      
+                      const frameInterval = setInterval(async () => {
+                        try {
+                          if (!cameraRef.current || !WebSocketService.isConnected) {
+                            console.log('Stopping streaming - camera or websocket not available');
+                            clearInterval(frameInterval);
+                            return;
+                          }
+
+                          const photo = await cameraRef.current.takePictureAsync({
+                            quality: 0.3,
+                            base64: true,
+                            exif: false,
+                          });
+
+                          if (photo && photo.base64) {
+                            WebSocketService.sendFrame(photo.base64, translationMode);
+                            // Log every 10 frames to avoid spam
+                            if (Math.random() < 0.1) console.log('Frame sent successfully');
+                          } else {
+                            console.warn('Failed to capture photo in direct streaming');
+                          }
+                        } catch (error) {
+                          console.error('Error in direct streaming:', error);
+                        }
+                      }, 500); // 2 FPS for testing
+
+                      // Store interval for cleanup
+                      cameraRef.current.streamingInterval = frameInterval;
+                    };
+
+                    startDirectStreaming();
+                  } else {
+                    console.log('Cannot start streaming - WebSocket not connected or camera not available', {
+                      cameraRef: !!cameraRef.current,
+                      webSocket: !!WebSocketService,
+                      isConnected: WebSocketService?.isConnected
+                    });
+                  }
+                }, 5000); // Wait 5 seconds for camera to be fully ready
+              }}
+              onError={(error) => {
+                console.error('Camera error:', error);
+                setCameraReady(false);
+              }}
+            />
+
+            {/* Detection Overlay */}
+            <DetectionOverlay 
+              detectionData={detectionData}
+              mode={translationMode}
+              isTranslating={isTranslating}
+              translationText={translationText}
+            />
+
+            {/* Camera Controls Overlay */}
+            <CameraControls 
+              facing={facing}
+              flash={flash}
+              zoom={zoom}
+              torch={torch}
+              onToggleFacing={toggleCameraFacing}
+              onToggleFlash={toggleFlash}
+              onToggleTorch={toggleTorch}
+              onAdjustZoom={adjustZoom}
+            />
           </View>
-
-          {/* Center Recording Button */}
-          <TouchableOpacity
-            style={[
-              styles.recordingButton,
-              isRecording && styles.recordingButtonActive,
-              (!cameraReady || hasPermission !== true) && styles.controlButtonDisabled
-            ]}
-            onPress={handleToggleRecording}
-            activeOpacity={0.8}
-            disabled={!cameraReady || hasPermission !== true}
-          >
-            <View style={styles.recordingButtonInner}>
-              {isRecording ? (
-                <View style={styles.stopIcon} />
-              ) : (
-                <View style={styles.recordIcon} />
-              )}
-            </View>
-          </TouchableOpacity>
-
-          {/* Right Controls */}
-          <View style={styles.controlGroup}>
-            <TouchableOpacity 
-              style={[
-                styles.controlButton,
-                zoom === 1 && styles.controlButtonDisabled
-              ]}
-              onPress={handleZoomIn}
-              disabled={zoom === 1 || !cameraReady || isRecording}
+        ) : hasPermission === false ? (
+          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+            <Text style={{ color: 'white', fontSize: 18, textAlign: 'center' }}>
+              Camera Permission Required
+            </Text>
+            <TouchableOpacity
+              onPress={requestCameraPermission}
+              style={{ marginTop: 20, padding: 15, backgroundColor: 'blue', borderRadius: 5 }}
             >
-              <View style={styles.controlIconContainer}>
-                <Text style={styles.controlButtonIcon}>+</Text>
-              </View>
-              <Text style={styles.controlButtonText}>Zoom In</Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              style={styles.controlButton}
-              onPress={handleToggleCamera}
-              disabled={!cameraReady || isRecording}
-            >
-              <View style={styles.controlIconContainer}>
-                <Text style={styles.controlButtonIcon}>↻</Text>
-              </View>
-              <Text style={styles.controlButtonText}>
-                {getCameraTypeText()}
-              </Text>
+              <Text style={{ color: 'white' }}>Grant Permission</Text>
             </TouchableOpacity>
           </View>
-        </View>
-
-        {/* Bottom Info Bar */}
-        <View style={styles.infoBar}>
-          <View style={styles.infoItem}>
-            <Text style={styles.infoIcon}>🤟</Text>
-            <Text style={styles.infoText}>Real-time</Text>
-          </View>
-          <View style={styles.infoDivider} />
-          <View style={styles.infoItem}>
-            <Text style={styles.infoIcon}>⚡</Text>
-            <Text style={styles.infoText}>Live Detection</Text>
-          </View>
-          <View style={styles.infoDivider} />
-          <View style={styles.infoItem}>
-            <Text style={styles.infoIcon}>🎯</Text>
-            <Text style={styles.infoText}>Accurate</Text>
-          </View>
-        </View>
-
-        {/* Detection Stats Overlay */}
-        {detectionData && isTranslating && (
-          <View style={styles.statsOverlay}>
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>
-                {detectionData.handCount || 0}
-              </Text>
-              <Text style={styles.statLabel}>Hands</Text>
-            </View>
-            <View style={styles.statDivider} />
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>
-                {detectionData.lipDetected ? 'Yes' : 'No'}
-              </Text>
-              <Text style={styles.statLabel}>Lips</Text>
-            </View>
-            <View style={styles.statDivider} />
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>
-                {detectionData.confidence ? `${Math.round(detectionData.confidence * 100)}%` : '0%'}
-              </Text>
-              <Text style={styles.statLabel}>Confidence</Text>
-            </View>
-            <View style={styles.statDivider} />
-            <View style={styles.statItem}>
-              <Text style={styles.statValue}>
-                {detectionData.gesture ? '✓' : '✗'}
-              </Text>
-              <Text style={styles.statLabel}>Gesture</Text>
-            </View>
+        ) : (
+          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+            <Text style={{ color: 'white', fontSize: 16 }}>Loading camera...</Text>
           </View>
         )}
       </SafeAreaView>
@@ -849,456 +644,228 @@ export default function CameraFullScreen({
 }
 
 const styles = StyleSheet.create({
-  // Add to styles in CameraFullScreen.js
-cameraContainer: {
-  flex: 1,
-  position: 'relative',
-},
-  container: {
+  waitingOverlay: {
     flex: 1,
-    backgroundColor: '#000000',
-  },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
+    justifyContent: 'center',
     alignItems: 'center',
-    paddingHorizontal: 15,
-    paddingVertical: 12,
-    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
   },
-  headerLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  closeButton: {
-    margin: 0,
-    marginRight: 10,
-  },
-  modeBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.primary,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
-  },
-  modeIcon: {
-    fontSize: 16,
-    marginRight: 6,
-  },
-  modeText: {
-    color: '#FFFFFF',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  headerRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  recordingIndicator: {
-    backgroundColor: colors.error,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 15,
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  recordingDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#FFFFFF',
-    marginRight: 6,
-  },
-  recordingText: {
-    color: '#FFFFFF',
-    fontSize: 11,
+  waitingText: {
+    color: 'white',
+    fontSize: 24,
     fontWeight: 'bold',
+    textAlign: 'center',
+    marginBottom: 10,
   },
-  processingIndicator: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 15,
+  waitingSubtext: {
+    color: 'white',
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 30,
   },
-  processingText: {
-    color: '#FFFFFF',
-    fontSize: 11,
-    marginLeft: 6,
-  },
-  cameraPreview: {
-    flex: 1,
-    backgroundColor: '#000000',
-    position: 'relative',
-  },
-  camera: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-
-
-  // Add these to the styles object
-detectionOverlay: {
-  position: 'absolute',
-  top: 0,
-  left: 0,
-  right: 0,
-  bottom: 0,
-  pointerEvents: 'none',
-  zIndex: 10,
-},
-landmarkPoint: {
-  position: 'absolute',
-  zIndex: 11,
-},
-connectionLine: {
-  position: 'absolute',
-  zIndex: 10,
-  transformOrigin: 'left center',
-},
-boundingBox: {
-  position: 'absolute',
-  zIndex: 9,
-  borderRadius: 4,
-},
-boundingBoxLabel: {
-  position: 'absolute',
-  top: -25,
-  left: 5,
-  paddingHorizontal: 8,
-  paddingVertical: 4,
-  borderRadius: 10,
-},
-boundingBoxLabelText: {
-  color: '#FFFFFF',
-  fontSize: 11,
-  fontWeight: 'bold',
-},
-detectionInfoContainer: {
-  position: 'absolute',
-  top: 20,
-  left: 20,
-  right: 20,
-  backgroundColor: 'rgba(0, 0, 0, 0.8)',
-  borderRadius: 15,
-  padding: 15,
-  zIndex: 20,
-},
-detectionStatus: {
-  marginBottom: 15,
-},
-statusRow: {
-  flexDirection: 'row',
-  justifyContent: 'space-between',
-  alignItems: 'center',
-  marginBottom: 8,
-},
-statusLabel: {
-  color: '#FFFFFF',
-  fontSize: 14,
-  fontWeight: '600',
-},
-statusText: {
-  color: '#FFFFFF',
-  fontSize: 14,
-},
-confidenceContainer: {
-  marginBottom: 15,
-},
-confidenceLabel: {
-  color: '#FFFFFF',
-  fontSize: 12,
-  marginBottom: 6,
-},
-confidenceBar: {
-  height: 8,
-  backgroundColor: 'rgba(255, 255, 255, 0.2)',
-  borderRadius: 4,
-  overflow: 'hidden',
-  marginBottom: 6,
-},
-confidenceFill: {
-  height: '100%',
-  borderRadius: 4,
-},
-confidencePercentage: {
-  color: '#FFFFFF',
-  fontSize: 12,
-  fontWeight: 'bold',
-  textAlign: 'right',
-},
-translationResult: {
-  borderTopWidth: 1,
-  borderTopColor: 'rgba(255, 255, 255, 0.2)',
-  paddingTop: 10,
-},
-translationLabel: {
-  color: '#FFFFFF',
-  fontSize: 12,
-  marginBottom: 5,
-},
-translationText: {
-  color: '#4CAF50',
-  fontSize: 18,
-  fontWeight: 'bold',
-},
-centerGuide: {
-  position: 'absolute',
-  top: '50%',
-  left: '50%',
-  marginLeft: -75,
-  marginTop: -75,
-  width: 150,
-  height: 150,
-  alignItems: 'center',
-  justifyContent: 'center',
-  zIndex: 5,
-},
-guideCircleLarge: {
-  width: 120,
-  height: 120,
-  borderRadius: 60,
-  borderWidth: 2,
-  borderColor: 'rgba(255, 255, 255, 0.2)',
-  borderStyle: 'dashed',
-},
-guideInstruction: {
-  position: 'absolute',
-  bottom: -30,
-  color: 'rgba(255, 255, 255, 0.7)',
-  fontSize: 12,
-  textAlign: 'center',
-},
-  gridOverlay: {
-    position: 'absolute',
-    width: '100%',
-    height: '100%',
-    justifyContent: 'center',
-    alignItems: 'center',
-    pointerEvents: 'none',
-  },
-  gridLineHorizontal: {
-    position: 'absolute',
-    width: '80%',
-    height: 1,
-    backgroundColor: 'rgba(255, 255, 255, 0.15)',
-  },
-  gridLineVertical: {
-    position: 'absolute',
-    width: 1,
-    height: '80%',
-    backgroundColor: 'rgba(255, 255, 255, 0.15)',
-  },
-  focusBox: {
+  guideCircle: {
     width: 100,
     height: 100,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.3)',
-    borderRadius: 10,
-    position: 'absolute',
+    borderRadius: 50,
+    borderWidth: 3,
+    borderColor: 'white',
+    borderStyle: 'dashed',
+    marginBottom: 10,
   },
-  modeIndicator: {
+  guideText: {
+    color: 'white',
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  processingOverlay: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  processingText: {
+    color: 'white',
+    fontSize: 18,
+    marginTop: 10,
+  },
+  detectionOverlay: {
     position: 'absolute',
-    bottom: 30,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  centerGuide: {
+    position: 'absolute',
+    top: '40%',
+    left: '50%',
+    transform: [{ translateX: -50 }, { translateY: -50 }],
     alignItems: 'center',
   },
-  modeIndicatorIcon: {
-    fontSize: 36,
-    marginBottom: 8,
+  guideCircleLarge: {
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    borderWidth: 2,
+    borderColor: 'rgba(255, 255, 255, 0.5)',
+    borderStyle: 'dashed',
   },
-  modeIndicatorLabel: {
-    color: '#FFFFFF',
+  guideInstruction: {
+    color: 'white',
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 10,
+  },
+  detectionInfoContainer: {
+    position: 'absolute',
+    bottom: 20,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    borderRadius: 10,
+    padding: 15,
+  },
+  detectionStatus: {
+    marginBottom: 15,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 5,
+  },
+  statusLabel: {
+    color: 'white',
     fontSize: 14,
-    fontWeight: '500',
+    fontWeight: 'bold',
+  },
+  statusText: {
+    color: 'white',
+    fontSize: 14,
+  },
+  confidenceContainer: {
+    marginBottom: 15,
+  },
+  confidenceLabel: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  confidenceBar: {
+    height: 8,
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  confidenceFill: {
+    height: '100%',
+    borderRadius: 4,
+  },
+  confidencePercentage: {
+    color: 'white',
+    fontSize: 12,
+    textAlign: 'right',
+    marginTop: 2,
+  },
+  translationResult: {
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.3)',
+    paddingTop: 10,
+  },
+  translationLabel: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  translationText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  connectionLine: {
+    position: 'absolute',
+    backgroundColor: 'rgba(255, 87, 34, 0.6)',
+  },
+  landmarkPoint: {
+    position: 'absolute',
+    borderRadius: 3,
+  },
+  boundingBox: {
+    position: 'absolute',
+    borderWidth: 2,
+    borderStyle: 'solid',
+  },
+  boundingBoxLabel: {
+    position: 'absolute',
+    top: -25,
+    left: 0,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  boundingBoxLabelText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  cameraControlsContainer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    pointerEvents: 'box-none',
+  },
+  topControls: {
+    position: 'absolute',
+    top: 120,
+    right: 20,
+    flexDirection: 'column',
+    gap: 10,
+  },
+  bottomControls: {
+    position: 'absolute',
+    bottom: 120,
+    left: 0,
+    right: 0,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+  controlButton: {
     backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    paddingHorizontal: 15,
-    paddingVertical: 8,
-    borderRadius: 15,
+    borderRadius: 25,
+    padding: 12,
+    alignItems: 'center',
+    minWidth: 60,
+    minHeight: 60,
+    justifyContent: 'center',
+  },
+  controlIcon: {
+    fontSize: 20,
+    color: 'white',
+    textAlign: 'center',
+  },
+  controlLabel: {
+    fontSize: 10,
+    color: 'white',
+    textAlign: 'center',
+    marginTop: 2,
   },
   zoomIndicator: {
     position: 'absolute',
-    top: 20,
-    right: 20,
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 12,
-  },
-  zoomText: {
-    color: '#FFFFFF',
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  permissionOverlay: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.9)',
-    padding: 30,
-  },
-  permissionTitle: {
-    color: '#FFFFFF',
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 15,
-    textAlign: 'center',
-  },
-  permissionText: {
-    color: '#FFFFFF',
-    fontSize: 14,
-    textAlign: 'center',
-    lineHeight: 20,
-    opacity: 0.8,
-    marginBottom: 20,
-  },
-  permissionButton: {
-    backgroundColor: colors.primary,
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    borderRadius: 25,
-  },
-  permissionButtonText: {
-    color: '#FFFFFF',
-    fontWeight: 'bold',
-    fontSize: 16,
-  },
-  controlsContainer: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 30,
-    paddingVertical: 20,
-    backgroundColor: 'rgba(0, 0, 0, 0.8)',
-  },
-  controlGroup: {
-    alignItems: 'center',
-  },
-  controlButton: {
-    alignItems: 'center',
-    padding: 8,
-    marginVertical: 5,
-    minWidth: 60,
-  },
-  controlButtonActive: {
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
-    borderRadius: 15,
-  },
-  controlButtonDisabled: {
-    opacity: 0.4,
-  },
-  controlIconContainer: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 5,
-  },
-  controlButtonIcon: {
-    fontSize: 18,
-    color: '#FFFFFF',
-    fontWeight: 'bold',
-  },
-  controlButtonText: {
-    color: '#FFFFFF',
-    fontSize: 10,
-    opacity: 0.8,
-  },
-  recordingButton: {
-    width: 70,
-    height: 70,
-    borderRadius: 35,
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 2,
-    borderColor: '#FFFFFF',
-  },
-  recordingButtonActive: {
-    backgroundColor: colors.error,
-    borderColor: colors.error,
-  },
-  recordingButtonInner: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
-    backgroundColor: '#FFFFFF',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  recordIcon: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: colors.error,
-  },
-  stopIcon: {
-    width: 20,
-    height: 20,
-    backgroundColor: '#000000',
-    borderRadius: 2,
-  },
-  infoBar: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingVertical: 12,
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(255, 255, 255, 0.1)',
-  },
-  infoItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 15,
-  },
-  infoIcon: {
-    fontSize: 14,
-    color: '#FFFFFF',
-    marginRight: 6,
-    opacity: 0.8,
-  },
-  infoText: {
-    color: '#FFFFFF',
-    fontSize: 12,
-    opacity: 0.8,
-  },
-  infoDivider: {
-    width: 1,
-    height: 15,
-    backgroundColor: 'rgba(255, 255, 255, 0.2)',
-  },
-  statsOverlay: {
-    position: 'absolute',
-    top: 80,
+    top: 120,
     left: 20,
     backgroundColor: 'rgba(0, 0, 0, 0.7)',
     borderRadius: 15,
-    padding: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
   },
-  statItem: {
-    alignItems: 'center',
-    paddingHorizontal: 8,
-  },
-  statValue: {
-    color: '#FFFFFF',
+  zoomText: {
+    color: 'white',
     fontSize: 12,
     fontWeight: 'bold',
-  },
-  statLabel: {
-    color: 'rgba(255, 255, 255, 0.6)',
-    fontSize: 10,
-    marginTop: 2,
-  },
-  statDivider: {
-    width: 1,
-    height: 18,
-    backgroundColor: 'rgba(255, 255, 255, 0.3)',
   },
 });

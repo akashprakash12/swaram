@@ -111,29 +111,58 @@ class CameraService {
     }
   }
 
-  // NEW: Optimized frame capture for streaming
+  // UPDATED: Optimized frame capture for streaming with better error handling
   async captureFrameForStream() {
     try {
-      if (!this.camera || !this.hasPermission) {
+      // Check if camera is available and ready
+      if (!this.camera) {
+        console.warn('Camera reference not available');
         return null;
       }
 
+      if (!this.hasPermission) {
+        console.warn('No camera permission');
+        return null;
+      }
+
+      // Check if camera is mounted (basic check)
+      if (typeof this.camera.takePictureAsync !== 'function') {
+        console.warn('Camera does not have takePictureAsync method. Available methods:', Object.getOwnPropertyNames(Object.getPrototypeOf(this.camera)));
+        return null;
+      }
+
+      // Use takePictureAsync with settings optimized for mobile devices
+      console.log('Attempting to capture photo with camera:', !!this.camera);
       const photo = await this.camera.takePictureAsync({
-        quality: 0.3, // Very low quality for fast streaming
+        quality: 0.3, // Lower quality for faster processing
         base64: true,
         exif: false,
-        skipProcessing: true,
       });
+      console.log('Photo captured:', { hasPhoto: !!photo, hasBase64: !!(photo && photo.base64), base64Length: photo?.base64?.length });
+
+      if (!photo || !photo.base64) {
+        console.warn('Failed to get base64 data from photo - photo object:', photo);
+        return null;
+      }
 
       return photo.base64;
     } catch (error) {
-      console.error('Stream capture error:', error);
+      // Log error details but don't spam console
+      if (this.frameCount % 30 === 0) {
+        console.error('Stream capture error:', {
+          message: error.message,
+          name: error.name,
+          cameraAvailable: !!this.camera,
+          hasPermission: this.hasPermission,
+          error: error
+        });
+      }
       return null;
     }
   }
 
   // UPDATED: Start streaming that actually sends frames
-  startStreaming(onFrameCallback, frameRate = 15, mode = 'both') {
+  startStreaming(onFrameCallback, frameRate = 10, mode = 'both') {
     if (this.isStreaming) {
       console.log('Already streaming');
       return;
@@ -142,6 +171,12 @@ class CameraService {
     // Check permission
     if (this.hasPermission === false) {
       console.warn('Cannot start streaming - no camera permission');
+      return;
+    }
+
+    // Check camera availability
+    if (!this.camera) {
+      console.warn('Cannot start streaming - camera not available');
       return;
     }
 
@@ -195,7 +230,10 @@ class CameraService {
             console.log(`Sent ${this.frameCount} frames to server`);
           }
         } else if (!frameBase64) {
-          console.log('Failed to capture frame');
+          // Log failure but don't spam
+          if (this.frameCount % 30 === 0) {
+            console.log('Failed to capture frame - camera may not be ready');
+          }
         } else if (!WebSocketService.isConnected) {
           console.log('WebSocket disconnected, stopping stream');
           this.stopStreaming();
