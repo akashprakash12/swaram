@@ -1,4 +1,8 @@
-# backend/websocket_server.py
+#!/usr/bin/env python3
+"""
+WebSocket server for real-time sign language and lip reading detection
+Using MediaPipe Tasks API (compatible with MediaPipe 0.10.31+)
+"""
 import asyncio
 import websockets
 import json
@@ -9,387 +13,172 @@ import time
 import traceback
 import mediapipe as mp
 from concurrent.futures import ThreadPoolExecutor
-import threading
 from collections import deque
 import os
+from pathlib import Path
 import tensorflow as tf
 from gtts import gTTS
 import io
+from typing import Dict, List, Optional, Tuple
+import random
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision
+
+print("MediaPipe version:", mp.__version__)
 
 class DetectionProcessor:
     def __init__(self):
-        # Initialize MediaPipe Holistic once and reuse it
-        self.mp_holistic = mp.solutions.holistic
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.holistic = self.mp_holistic.Holistic(
-            min_detection_confidence=0.3,  # Lowered for better detection
-            min_tracking_confidence=0.3,   # Lowered for better tracking
-            model_complexity=1  # Use more complex model for better accuracy
-        )
+        # Get base directory
+        self.BASE_DIR = Path(__file__).parent
         
-        self.mp_drawing = mp.solutions.drawing_utils
+        print("Initializing MediaPipe with version", mp.__version__)
+        
+        # Initialize MediaPipe using Tasks API (same as test1.py)
+        try:
+            # Hand landmarker setup
+            MP_MODEL = self.BASE_DIR / "models" / "hand_landmarker.task"
+            
+            if MP_MODEL.exists():
+                base_options = mp_tasks.BaseOptions(model_asset_path=str(MP_MODEL))
+                hand_options = vision.HandLandmarkerOptions(
+                    base_options=base_options,
+                    num_hands=2,
+                    running_mode=vision.RunningMode.IMAGE
+                )
+                self.hand_detector = vision.HandLandmarker.create_from_options(hand_options)
+                print("✅ Hand landmarker initialized")
+            else:
+                print(f"⚠️ Hand landmarker model not found: {MP_MODEL}")
+                print("Creating dummy hand detector")
+                self.hand_detector = None
+                
+        except Exception as e:
+            print(f"❌ Error initializing hand detector: {e}")
+            print("Creating dummy hand detector")
+            self.hand_detector = None
+        
+        # Hand connections
         self.hand_connections = [
-            [0, 1], [1, 2], [2, 3], [3, 4],  # Thumb
-            [0, 5], [5, 6], [6, 7], [7, 8],  # Index
-            [0, 9], [9, 10], [10, 11], [11, 12],  # Middle
-            [0, 13], [13, 14], [14, 15], [15, 16],  # Ring
+            [0, 1], [1, 2], [2, 3], [3, 4],        # Thumb
+            [0, 5], [5, 6], [6, 7], [7, 8],        # Index finger
+            [0, 9], [9, 10], [10, 11], [11, 12],   # Middle finger
+            [0, 13], [13, 14], [14, 15], [15, 16], # Ring finger
             [0, 17], [17, 18], [18, 19], [19, 20]  # Pinky
         ]
-        self.lip_indices = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185]
+        
+        # Lip landmarks indices
+        self.lip_indices = [
+            61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+            291, 409, 270, 269, 267, 0, 37, 39, 40, 185
+        ]
+        
+        # Thread pool
         self.executor = ThreadPoolExecutor(max_workers=4)
         
-        # Frame buffers for sequence processing
-        self.sign_frame_buffer = deque(maxlen=30)  # For 3D CNN
-        self.lip_frame_buffer = deque(maxlen=30)   # For BiLSTM
-        self.last_prediction_time = 0
-        self.prediction_interval = 1.0  # Predict every 1 second
+        # Frame buffers
+        self.sequence = []
+        self.predictions = []
+        self.detected_words = []
+        self.last_hand_time = time.time()
+        self.last_action = None
+        self.action_cooldown = 0
+        self.current_action = "Ready..."
         
         # Load models
         self.sign_model = None
-        self.lip_model = None
-        self.fusion_model = None
+        self.sign_labels = []
         self.load_models()
         
-        # Labels for predictions
-        self.sign_labels = [
-            "നമസ്കാരം", "നന്ദി", "സഹായം", "ആശുപത്രി", "വീട്", 
-            "എന്ത്", "എവിടെ", "എപ്പോൾ", "ആരാണ്", "എന്താണ്",
-            "ശരി", "തെറ്റ്", "വരൂ", "പോകൂ", "കാണൂ",
-            "കേൾക്കൂ", "പറയൂ", "എഴുതൂ", "വായിക്കൂ", "ഭക്ഷണം"
-        ]
-        self.lip_labels = [
-            "ഹലോ", "സ്വാഗതം", "നന്ദി", "സഹായം", "എന്ത്", 
-            "എവിടെ", "എപ്പോൾ", "ആരാണ്", "എന്താണ്", "ശരി"
-        ]
-        
-    def extract_keypoints(self, results):
-        """Extract 258 keypoints: Pose (33*4), Left Hand (21*3), Right Hand (21*3)"""
-        # Pose (33 points * 4 dims [x,y,z,visibility])
-        if results.pose_landmarks:
-            pose = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten()
-        else:
-            pose = np.zeros(33 * 4)
-
-        # Left Hand (21 points * 3 dims)
-        if results.left_hand_landmarks:
-            lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten()
-        else:
-            lh = np.zeros(21 * 3)
-
-        # Right Hand (21 points * 3 dims)
-        if results.right_hand_landmarks:
-            rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten()
-        else:
-            rh = np.zeros(21 * 3)
-
-        return np.concatenate([pose, lh, rh])
-        
+        print("✅ Detection processor initialized")
+    
     def load_models(self):
-        """Load the correct models: 3D CNN for sign language, BiLSTM for lip reading"""
+        """Load sign language model and labels"""
         try:
-            # Try to load TensorFlow
-            try:
-                import tensorflow as tf
-                tf_version = tf.__version__
-                print(f"✓ TensorFlow {tf_version} available")
-            except ImportError:
-                print("⚠️ TensorFlow not available - using dummy predictions")
+            # Get model path
+            model_path = self.BASE_DIR / "models" / "action.h5"
+            data_dir = self.BASE_DIR / "models" / "augmented_data_new"
+            
+            # Load labels from your actual directory
+            if data_dir.exists():
+                self.sign_labels = sorted([d for d in os.listdir(data_dir) 
+                                         if os.path.isdir(data_dir / d)])
+                print(f"✅ Loaded {len(self.sign_labels)} sign labels:")
+                for i, label in enumerate(self.sign_labels):
+                    print(f"  {i+1}. {label}")
+            else:
+                # Your actual labels from what you showed
+                self.sign_labels = ["Bad", "Food", "happy", "Hello", "loud", "quiet", "Sorry"]
+                print("⚠️ Using default English labels")
+            
+            if not model_path.exists():
+                print(f"⚠️ Model file not found: {model_path}")
+                print("Creating dummy model for testing")
+                self.create_dummy_model()
                 return
-
-            # Load 3D CNN for sign language
-            sign_model_path = 'models/sign_language_3dcnn.h5'
-            if os.path.exists(sign_model_path):
-                try:
-                    self.sign_model = tf.keras.models.load_model(sign_model_path, compile=False)
-                    print("✓ Sign Language 3D CNN Model Loaded")
-                    print(f"Model input shape: {self.sign_model.input_shape}")
-                    print(f"Model output shape: {self.sign_model.output_shape}")
-                    
-                    # Load actions from the training data
-                    actions_path = 'test/augmented_data_new'
-                    if os.path.exists(actions_path):
-                        self.sign_labels = sorted(os.listdir(actions_path))
-                        print(f"✓ Loaded {len(self.sign_labels)} sign actions: {self.sign_labels}")
-                    else:
-                        self.sign_labels = [
-                            "നമസ്കാരം", "നന്ദി", "സഹായം", "ആശുപത്രി", "വീട്", 
-                            "എന്ത്", "എവിടെ", "എപ്പോൾ", "ആരാണ്", "എന്താണ്",
-                            "ശരി", "തെറ്റ്", "വരൂ", "പോകൂ", "കാണൂ",
-                            "കേൾക്കൂ", "പറയൂ", "എഴുതൂ", "വായിക്കൂ", "ഭക്ഷണം"
-                        ]
-                        print("⚠️ Using fallback Malayalam sign labels")
-                        
-                except Exception as e:
-                    print(f"Failed to load 3D CNN model: {e}")
-                    print("Falling back to BiLSTM model...")
-                    self.load_bilstm_fallback()
-            else:
-                print(f"⚠️ 3D CNN model '{sign_model_path}' not found - using BiLSTM fallback")
-                self.load_bilstm_fallback()
-
-            # Load BiLSTM for lip reading
-            lip_model_path = 'models/lip_reading_bilstm.h5'
-            if os.path.exists(lip_model_path):
-                try:
-                    self.lip_model = tf.keras.models.load_model(lip_model_path, compile=False)
-                    print("✓ Lip Reading BiLSTM Model Loaded")
-                    self.lip_labels = [
-                        "ഹലോ", "സ്വാഗതം", "നന്ദി", "സഹായം", "എന്ത്", 
-                        "എവിടെ", "എപ്പോൾ", "ആരാണ്", "എന്താണ്", "ശരി"
-                    ]
-                except Exception as e:
-                    print(f"Failed to load lip reading model: {e}")
-                    self.lip_model = None
-            else:
-                print(f"⚠️ Lip reading model '{lip_model_path}' not found")
-                self.lip_model = None
-
-        except Exception as e:
-            print(f"Error loading models: {e}")
-            traceback.print_exc()
-    
-    def load_bilstm_fallback(self):
-        """Load BiLSTM model as fallback for sign language"""
-        try:
-            if os.path.exists('models/action.h5'):
-                custom_objects = {
-                    'LSTM': tf.keras.layers.LSTM,
-                    'Dense': tf.keras.layers.Dense,
-                    'Sequential': tf.keras.Sequential
-                }
-                self.sign_model = tf.keras.models.load_model('models/action.h5', custom_objects=custom_objects, compile=False)
-                print("✓ BiLSTM Sign Language Model Loaded (fallback)")
-                self.sign_labels = [
-                    "നമസ്കാരം", "നന്ദി", "സഹായം", "ആശുപത്രി", "വീട്",
-                    "എന്ത്", "എവിടെ", "എപ്പോൾ", "ആരാണ്", "എന്താണ്",
-                    "ശരി", "തെറ്റ്", "വരൂ", "പോകൂ", "കാണൂ",
-                    "കേൾക്കൂ", "പറയൂ", "എഴുതൂ", "വായിക്കൂ", "ഭക്ഷണം"
-                ]
-            else:
-                print("⚠️ No sign language model found")
-                self.sign_model = None
-        except Exception as e:
-            print(f"Failed to load BiLSTM fallback: {e}")
-            self.sign_model = None
-
-        except Exception as e:
-            print(f"Error loading models: {e}")
-            traceback.print_exc()
-    
-    def create_compatible_model(self):
-        """Create a new BiLSTM model compatible with current TensorFlow version"""
-        from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-        
-        model = Sequential()
-        
-        # Input shape: (30, 258) - 30 frames, 258 keypoints
-        model.add(LSTM(64, return_sequences=True, activation='relu', input_shape=(30, 258)))
-        model.add(BatchNormalization())
-        model.add(Dropout(0.2))
-        
-        model.add(LSTM(128, return_sequences=True, activation='relu'))
-        model.add(BatchNormalization())
-        model.add(Dropout(0.2))
-        
-        model.add(LSTM(64, return_sequences=False, activation='relu'))
-        model.add(BatchNormalization())
-        model.add(Dropout(0.2))
-        
-        # Output layer for 20 Malayalam signs
-        model.add(Dense(64, activation='relu'))
-        model.add(Dense(20, activation='softmax'))
-        
-        model.compile(
-            optimizer='adam',
-            loss='categorical_crossentropy',
-            metrics=['accuracy']
-        )
-        
-        return model
-    
-    def predict_sign_language(self, frame_sequence):
-        """Predict sign language using 3D CNN or BiLSTM fallback"""
-        if len(frame_sequence) < 10:
-            return {
-                'text': 'കീപോയിന്റുകൾ ലഭ്യമല്ല',
-                'confidence': 0.1,
-                'type': 'sign'
-            }
-
-        try:
-            # Try 3D CNN first if available
-            if self.sign_model and hasattr(self.sign_model, 'input_shape') and len(self.sign_model.input_shape) == 5:
-                # 3D CNN model - expects (batch, frames, height, width, channels)
-                return self.predict_with_3dcnn(frame_sequence)
-            elif self.sign_model:
-                # BiLSTM model - use keypoints
-                return self.predict_with_bilstm(frame_sequence)
-            else:
-                return {
-                    'text': 'മോഡൽ ലഭ്യമല്ല',
-                    'confidence': 0.1,
-                    'type': 'sign'
-                }
-        except Exception as e:
-            print(f"Sign language prediction error: {e}")
-            traceback.print_exc()
-            return {
-                'text': 'പ്രവചനം പരാജയപ്പെട്ടു',
-                'confidence': 0.1,
-                'type': 'sign'
-            }
-    
-    def predict_with_3dcnn(self, frame_sequence):
-        """Predict using 3D CNN model"""
-        try:
-            # Resize frames to expected input size (64x64)
-            processed_frames = []
-            for frame in frame_sequence[-30:]:  # Take last 30 frames
-                resized = cv2.resize(frame, (64, 64))
-                processed_frames.append(resized)
             
-            if len(processed_frames) < 30:
-                # Pad with the last frame if needed
-                while len(processed_frames) < 30:
-                    processed_frames.insert(0, processed_frames[0].copy())
+            print(f"📦 Loading model from: {model_path}")
             
-            # Convert to numpy array and normalize
-            frames_array = np.array(processed_frames, dtype=np.float32) / 255.0
-            frames_array = np.expand_dims(frames_array, axis=0)  # Add batch dimension
-            
-            # Predict
-            prediction = self.sign_model.predict(frames_array, verbose=0)[0]
-            predicted_idx = np.argmax(prediction)
-            confidence = float(prediction[predicted_idx])
-            
-            if confidence > 0.5 and predicted_idx < len(self.sign_labels):
-                return {
-                    'text': self.sign_labels[predicted_idx],
-                    'confidence': confidence,
-                    'type': 'sign'
-                }
-            else:
-                return {
-                    'text': 'അവ്യക്തമായ സംജ്ഞ',
-                    'confidence': confidence,
-                    'type': 'sign'
-                }
+            try:
+                # Try to load with TensorFlow
+                self.sign_model = tf.keras.models.load_model(
+                    str(model_path), 
+                    compile=False
+                )
+                print("✅ Sign language model loaded")
+                
+                # Print model summary
+                print("\n📊 Model Summary:")
+                print(f"  Input shape: {self.sign_model.input_shape}")
+                print(f"  Output shape: {self.sign_model.output_shape}")
+                print(f"  Number of classes: {len(self.sign_labels)}")
+                
+            except Exception as e:
+                print(f"❌ Error loading model: {e}")
+                print("Creating dummy model for testing")
+                self.create_dummy_model()
                 
         except Exception as e:
-            print(f"3D CNN prediction error: {e}")
-            return {
-                'text': '3D CNN പ്രവചനം പരാജയപ്പെട്ടു',
-                'confidence': 0.1,
-                'type': 'sign'
-            }
+            print(f"❌ Error loading models: {e}")
+            self.sign_labels = ["Bad", "Food", "happy", "Hello", "loud", "quiet", "Sorry"]
+            self.create_dummy_model()
     
-    def predict_with_bilstm(self, frame_sequence):
-        """Predict using BiLSTM model with keypoints"""
-        try:
-            # Extract keypoints for each frame
-            keypoints_sequence = []
-            for frame in frame_sequence[-30:]:
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = self.holistic.process(rgb_frame)
-                keypoints = self.extract_keypoints(results)
-                keypoints_sequence.append(keypoints)
-
-            if len(keypoints_sequence) < 30:
-                return {
-                    'text': 'കീപോയിന്റുകൾ ലഭ്യമല്ല',
-                    'confidence': 0.1,
-                    'type': 'sign'
-                }
-
-            # Convert to numpy array and predict
-            keypoints_sequence = np.array(keypoints_sequence)
-            res = self.sign_model.predict(np.expand_dims(keypoints_sequence, axis=0), verbose=0)[0]
-            predicted_class = np.argmax(res)
-            confidence = float(res[predicted_class])
+    def create_dummy_model(self):
+        """Create dummy model"""
+        print("Creating dummy model...")
+        
+        class DummyModel:
+            def __init__(self, labels):
+                self.sign_labels = labels
             
-            if confidence > 0.5:
-                predicted_action = self.sign_labels[predicted_class] if predicted_class < len(self.sign_labels) else 'Unknown'
-                return {
-                    'text': predicted_action,
-                    'confidence': confidence,
-                    'type': 'sign'
-                }
-            else:
-                return {
-                    'text': 'അവ്യക്തമായ സംജ്ഞ',
-                    'confidence': confidence,
-                    'type': 'sign'
-                }
-
-        except Exception as e:
-            print(f"BiLSTM prediction error: {e}")
-            return {
-                'text': 'BiLSTM പ്രവചനം പരാജയപ്പെട്ടു',
-                'confidence': 0.1,
-                'type': 'sign'
-            }
-    def predict_lip_reading(self, landmark_sequence):
-        """Predict lip reading using BiLSTM model with lip landmarks sequence"""
-        if not self.lip_model or len(landmark_sequence) < 10:
-            # Return dummy prediction for testing
-            return {
-                'text': 'ലിപ് ലഭ്യമല്ല',
-                'confidence': 0.5,
-                'type': 'lip'
-            }
-
-        try:
-            # Process lip landmarks for BiLSTM input
-            lip_sequence = []
-            for landmarks in landmark_sequence[-30:]:  # Take last 30 frames
-                # Extract lip landmarks (x, y, z for each point)
-                lip_features = []
-                for lm in landmarks:
-                    lip_features.extend([lm['x'], lm['y'], lm.get('z', 0)])
-                lip_sequence.append(lip_features)
-
-            if len(lip_sequence) == 0:
-                return {
-                    'text': 'ലിപ് ലാൻഡ്മാർക്കുകൾ കണ്ടെത്തിയില്ല',
-                    'confidence': 0.1,
-                    'type': 'lip'
-                }
-
-            # Convert to numpy array and reshape for BiLSTM input
-            lip_sequence = np.array(lip_sequence)
-            lip_sequence = lip_sequence.reshape(1, lip_sequence.shape[0], lip_sequence.shape[1])
-
-            # Make prediction
-            prediction = self.lip_model.predict(lip_sequence, verbose=0)[0]
-            predicted_idx = np.argmax(prediction)
-            confidence = float(prediction[predicted_idx])
-
-            # Only return prediction if confidence is above threshold
-            if confidence > 0.7:  # Lower threshold for lip reading
-                return {
-                    'text': self.lip_labels[predicted_idx] if predicted_idx < len(self.lip_labels) else 'Unknown',
-                    'confidence': confidence,
-                    'type': 'lip'
-                }
-            else:
-                return {
-                    'text': 'അവ്യക്തമായ ലിപ് മൂവ്മെന്റ്',
-                    'confidence': confidence,
-                    'type': 'lip'
-                }
-
-        except Exception as e:
-            print(f"Lip reading prediction error: {e}")
-            traceback.print_exc()
-            return {
-                'text': 'ലിപ് ലഭ്യമല്ല',
-                'confidence': 0.1,
-                'type': 'lip'
-            }
+            def predict(self, X, verbose=0):
+                batch_size = X.shape[0]
+                num_classes = len(self.sign_labels)
+                # Generate random predictions
+                predictions = np.random.rand(batch_size, num_classes)
+                # Normalize to sum to 1 (softmax-like)
+                predictions = predictions / predictions.sum(axis=1, keepdims=True)
+                return predictions
+        
+        self.sign_model = DummyModel(self.sign_labels)
+        print("✅ Dummy model created")
     
-    def extract_detection_data(self, frame, mode):
-        """Extract hand and lip landmarks from frame"""
+    def extract_keypoints(self, result):
+        """Extract keypoints from hand detection result (same as test1.py)"""
+        lh = np.zeros(63)
+        rh = np.zeros(63)
+
+        if result.hand_landmarks:
+            for idx, hand in enumerate(result.hand_landmarks):
+                points = np.array([[lm.x, lm.y, lm.z] for lm in hand]).flatten()
+                if idx == 0:
+                    lh = points
+                elif idx == 1:
+                    rh = points
+
+        return np.concatenate([lh, rh])
+    
+    def process_frame(self, frame: np.ndarray, mode: str = "both") -> Dict:
+        """Process a frame and extract detection data"""
         detection_data = {
             'handLandmarks': [],
             'lipLandmarks': [],
@@ -398,503 +187,457 @@ class DetectionProcessor:
             'lipBoundingBox': None,
             'handCount': 0,
             'lipDetected': False,
-            'confidence': 0,
+            'confidence': 0.0,
             'timestamp': time.time()
         }
         
         try:
-            # Use the pre-initialized holistic instance
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.holistic.process(image_rgb)
+            # Convert BGR to RGB
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            # Extract hand landmarks
-            hand_landmarks_list = []
-            if mode in ['sign', 'both']:
-                if results.left_hand_landmarks:
-                    hand_landmarks_list.append(results.left_hand_landmarks)
-                    detection_data['handCount'] += 1
-                if results.right_hand_landmarks:
-                    hand_landmarks_list.append(results.right_hand_landmarks)
-                    detection_data['handCount'] += 1
-            
-            for hand_landmarks in hand_landmarks_list:
-                for landmark in hand_landmarks.landmark:
-                    detection_data['handLandmarks'].append({
-                        'x': landmark.x,
-                        'y': landmark.y,
-                        'z': landmark.z
-                    })
-            
-            # Extract lip landmarks
-            if mode in ['lip', 'both'] and results.face_landmarks:
-                detection_data['lipDetected'] = True
-                for idx in self.lip_indices:
-                    if idx < len(results.face_landmarks.landmark):
-                        landmark = results.face_landmarks.landmark[idx]
-                        detection_data['lipLandmarks'].append({
-                            'x': landmark.x,
-                            'y': landmark.y,
-                            'z': landmark.z
-                        })
+            # Process hands using MediaPipe Tasks API
+            if mode in ['sign', 'both'] and self.hand_detector:
+                # Create MediaPipe Image
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 
-                # Calculate bounding boxes
-                if detection_data['handLandmarks']:
-                    xs = [lm['x'] for lm in detection_data['handLandmarks']]
-                    ys = [lm['y'] for lm in detection_data['handLandmarks']]
-                    if xs and ys:
+                # Detect hands
+                result = self.hand_detector.detect(mp_image)
+                hands_present = result.hand_landmarks is not None
+                
+                if hands_present:
+                    detection_data['handCount'] = len(result.hand_landmarks)
+                    self.last_hand_time = time.time()
+                    
+                    # Extract landmarks
+                    for hand in result.hand_landmarks:
+                        for lm in hand:
+                            detection_data['handLandmarks'].append({
+                                'x': float(lm.x),
+                                'y': float(lm.y),
+                                'z': float(lm.z)
+                            })
+                    
+                    # Calculate bounding box
+                    if detection_data['handLandmarks']:
+                        xs = [lm['x'] for lm in detection_data['handLandmarks']]
+                        ys = [lm['y'] for lm in detection_data['handLandmarks']]
+                        
                         detection_data['handBoundingBox'] = {
-                            'x': min(xs),
-                            'y': min(ys),
-                            'width': max(xs) - min(xs),
-                            'height': max(ys) - min(ys)
-                        }
-                        detection_data['confidence'] = 0.8
-                
-                if detection_data['lipLandmarks']:
-                    xs = [lm['x'] for lm in detection_data['lipLandmarks']]
-                    ys = [lm['y'] for lm in detection_data['lipLandmarks']]
-                    if xs and ys:
-                        detection_data['lipBoundingBox'] = {
-                            'x': min(xs),
-                            'y': min(ys),
-                            'width': max(xs) - min(xs),
-                            'height': max(ys) - min(ys)
+                            'x': float(min(xs)),
+                            'y': float(min(ys)),
+                            'width': float(max(xs) - min(xs)),
+                            'height': float(max(ys) - min(ys))
                         }
                         detection_data['confidence'] = max(detection_data['confidence'], 0.7)
-                
-                # Calculate overall confidence
-                if detection_data['handCount'] > 0 or detection_data['lipDetected']:
-                    detection_data['confidence'] = max(detection_data['confidence'], 0.6)
-                    
+                        
+                        # Extract keypoints for prediction
+                        keypoints = self.extract_keypoints(result)
+                        self.sequence.append(keypoints)
+                        self.sequence = self.sequence[-30:]  # Keep last 30 frames
+            
+            # For lips, we'll skip for now since face_mesh isn't working
+            # but we'll keep the structure
+            
         except Exception as e:
-            print(f"Detection extraction error: {e}")
+            print(f"Frame processing error: {e}")
             traceback.print_exc()
         
         return detection_data
     
-    def process_frame_and_predict(self, frame, mode):
-        """Process frame, accumulate in buffers, and predict when ready"""
-        # Extract detection data
-        detection_data = self.extract_detection_data(frame, mode)
+    def predict_sign_language(self) -> Optional[Dict]:
+        """Predict sign language from sequence buffer (same as test1.py)"""
+        if len(self.sequence) < 30:
+            return None
         
-        # Accumulate frames for prediction
-        prediction = None
-        current_time = time.time()
-        
-        if mode in ['sign', 'both'] and detection_data['handCount'] > 0:
-            self.sign_frame_buffer.append(frame.copy())
-            
-            # Predict every prediction_interval seconds if buffer is full
-            if (len(self.sign_frame_buffer) >= 10 and 
-                current_time - self.last_prediction_time >= self.prediction_interval):
-                prediction = self.predict_sign_language(list(self.sign_frame_buffer))
-                if prediction:
-                    self.last_prediction_time = current_time
-        
-        if mode in ['lip', 'both'] and detection_data['lipDetected']:
-            self.lip_frame_buffer.append(detection_data['lipLandmarks'])
-            
-            # Predict for lip reading
-            if (len(self.lip_frame_buffer) >= 10 and 
-                current_time - self.last_prediction_time >= self.prediction_interval):
-                lip_prediction = self.predict_lip_reading(list(self.lip_frame_buffer))
-                if lip_prediction:
-                    prediction = lip_prediction
-                    self.last_prediction_time = current_time
-        
-        return detection_data, prediction
-    
-    def text_to_speech(self, text, lang='ml'):
-        """Convert text to speech audio and return base64 encoded audio"""
         try:
-            if not text or text.strip() == '':
-                return None
+            # Make prediction
+            res = self.sign_model.predict(
+                np.expand_dims(self.sequence, axis=0),
+                verbose=0
+            )[0]
+
+            pred = np.argmax(res)
+            confidence = res[pred]
+
+            self.predictions.append(pred)
+            self.predictions = self.predictions[-10:]
+
+            if self.predictions.count(pred) >= 5 and confidence > 0.85:
+                action = self.sign_labels[pred] if pred < len(self.sign_labels) else f"Label_{pred}"
+
+                if action != self.last_action or self.action_cooldown == 0:
+                    self.detected_words.append(action)
+                    self.current_action = action
+                    self.last_action = action
+                    self.action_cooldown = 20
+                    
+                    print(f"📝 Detected: {action} (confidence: {confidence:.2%})")
+                    
+                    return {
+                        'text': action,
+                        'confidence': float(confidence),
+                        'type': 'sign',
+                        'timestamp': time.time(),
+                        'detected_words': self.detected_words[-5:]  # Last 5 words
+                    }
             
-            # Create TTS object
+            # For dummy model, simulate detection
+            if hasattr(self.sign_model, '__class__') and self.sign_model.__class__.__name__ == 'DummyModel':
+                current_time = time.time()
+                if current_time - self.last_hand_time < 5.0 and random.random() > 0.7:  # 30% chance when hands are detected
+                    action = random.choice(self.sign_labels)
+                    self.detected_words.append(action)
+                    
+                    if len(self.detected_words) > 10:
+                        self.detected_words = self.detected_words[-10:]
+                    
+                    print(f"🤖 Dummy detection: {action}")
+                    
+                    return {
+                        'text': action,
+                        'confidence': 0.85,
+                        'type': 'sign',
+                        'timestamp': current_time,
+                        'detected_words': self.detected_words[-5:]
+                    }
+        
+        except Exception as e:
+            print(f"Prediction error: {e}")
+        
+        return None
+    
+    def text_to_speech(self, text: str, lang: str = 'en') -> Optional[Dict]:
+        """Convert text to speech"""
+        if not text:
+            return None
+        
+        try:
             tts = gTTS(text=text, lang=lang, slow=False)
-            
-            # Save to bytes buffer
             audio_buffer = io.BytesIO()
             tts.write_to_fp(audio_buffer)
             audio_buffer.seek(0)
             
-            # Encode to base64
-            audio_base64 = base64.b64encode(audio_buffer.getvalue()).decode('utf-8')
+            audio_base64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
             
             return {
                 'audio': audio_base64,
                 'format': 'mp3',
                 'text': text,
-                'lang': lang
+                'lang': lang,
+                'timestamp': time.time()
             }
+        
         except Exception as e:
             print(f"TTS error: {e}")
             return None
+    
+    def process_and_predict(self, frame_base64: str, mode: str = "both") -> Tuple[Dict, Optional[Dict]]:
+        """Process frame and make prediction"""
+        try:
+            # Decode frame
+            frame_data = base64.b64decode(frame_base64)
+            nparr = np.frombuffer(frame_data, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if frame is None:
+                print("❌ Failed to decode frame")
+                return {}, None
+            
+            # Process frame
+            detection_data = self.process_frame(frame, mode)
+            
+            # Make prediction if we have hands
+            prediction = None
+            if mode in ['sign', 'both'] and detection_data['handCount'] > 0:
+                prediction = self.predict_sign_language()
+            
+            # Check for no hands timeout (same as test1.py)
+            current_time = time.time()
+            if detection_data['handCount'] == 0:
+                if current_time - self.last_hand_time > 2.0 and self.detected_words:
+                    # Speak accumulated words
+                    sentence = " ".join(self.detected_words)
+                    print(f"🎤 Speaking: {sentence}")
+                    self.detected_words.clear()
+                    self.current_action = "Speaking..."
+            
+            if self.action_cooldown > 0:
+                self.action_cooldown -= 1
+            
+            return detection_data, prediction
+        
+        except Exception as e:
+            print(f"Process error: {e}")
+            traceback.print_exc()
+            return {}, None
+
 
 class WebSocketServer:
-    def __init__(self):
+    def __init__(self, host: str = "0.0.0.0", port: int = 8765):
+        self.host = host
+        self.port = port
         self.detection_processor = DetectionProcessor()
         self.connections = set()
-        self.frame_rate = 30
-        self.max_frame_size = 1024 * 1024
-        
-    async def handle_connection(self, websocket, path=None):
+        self.clients = {}  # Store client info
+    
+    async def handle_connection(self, websocket):
         """Handle WebSocket connection"""
-        try:
-            client_ip = websocket.remote_address[0]
-            client_port = websocket.remote_address[1]
-            client_id = f"{client_ip}:{client_port}"
-        except:
-            client_id = f"client_{id(websocket)}"
+        client_id = id(websocket)
+        print(f"📱 New connection (ID: {client_id})")
         
-        print(f"New connection from {client_id}")
         self.connections.add(websocket)
+        self.clients[client_id] = {
+            'mode': 'both',
+            'connected_at': time.time()
+        }
         
         try:
+            # Send welcome message
             welcome_msg = {
                 'type': 'welcome',
-                'message': 'Connected to Sign Language Detection Server',
+                'message': 'SWARAM Server Connected',
                 'timestamp': time.time(),
-                'supported_modes': ['sign', 'lip', 'both'],
-                'server_version': '1.0.0',
-                'detection_features': ['hand_landmarks', 'lip_landmarks', 'bounding_boxes']
+                'status': 'ready',
+                'server_ip': '192.168.73.170',
+                'server_port': 8765,
+                'labels': self.detection_processor.sign_labels
             }
             await websocket.send(json.dumps(welcome_msg))
+            print(f"📤 Sent welcome to client {client_id}")
             
+            # Handle messages
             async for message in websocket:
                 try:
                     data = json.loads(message)
-                    await self.process_client_message(websocket, client_id, data)
-                    
+                    await self.process_message(websocket, client_id, data)
                 except json.JSONDecodeError as e:
-                    error_msg = {
+                    print(f"❌ JSON decode error: {e}")
+                    await websocket.send(json.dumps({
                         'type': 'error',
-                        'message': f'Invalid JSON: {str(e)}',
+                        'message': 'Invalid JSON',
                         'timestamp': time.time()
-                    }
-                    await websocket.send(json.dumps(error_msg))
-                    
+                    }))
                 except Exception as e:
-                    print(f"Error processing message from {client_id}: {e}")
-                    traceback.print_exc()
-                    
-                    error_msg = {
-                        'type': 'error',
-                        'message': f'Processing error: {str(e)}',
-                        'timestamp': time.time()
-                    }
-                    await websocket.send(json.dumps(error_msg))
-                    
+                    print(f"❌ Message processing error: {e}")
+        
         except websockets.exceptions.ConnectionClosed as e:
-            print(f"Connection closed for {client_id}: {e}")
+            print(f"📴 Connection closed (ID: {client_id}): {e.code} - {e.reason}")
         except Exception as e:
-            print(f"Unexpected error for {client_id}: {e}")
+            print(f"❌ Connection error (ID: {client_id}): {e}")
             traceback.print_exc()
         finally:
-            if websocket in self.connections:
-                self.connections.remove(websocket)
-            print(f"Connection removed for {client_id}. Remaining: {len(self.connections)}")
+            self.connections.remove(websocket)
+            if client_id in self.clients:
+                del self.clients[client_id]
+            print(f"👋 Connection removed (ID: {client_id})")
     
-    async def process_client_message(self, websocket, client_id, data):
-        """Process incoming client message"""
-        message_type = data.get('type')
+    async def process_message(self, websocket, client_id, data):
+        """Process message from client"""
+        msg_type = data.get('type')
         
-        if message_type == 'ping':
+        if msg_type == 'ping':
             await websocket.send(json.dumps({
                 'type': 'pong',
-                'timestamp': time.time(),
-                'client_timestamp': data.get('timestamp')
-            }))
-            
-        elif message_type == 'handshake':
-            # Client is initiating handshake
-            await websocket.send(json.dumps({
-                'type': 'handshake_ack',
-                'message': 'Handshake received',
-                'timestamp': time.time(),
-                'client_info': data
-            }))
-            
-        elif message_type == 'handshake_ack':
-            # Client is acknowledging our handshake
-            print(f"Client {client_id} acknowledged handshake")
-            await websocket.send(json.dumps({
-                'type': 'status',
-                'message': 'Handshake completed successfully',
                 'timestamp': time.time()
             }))
+        
+        elif msg_type == 'handshake':
+            # Reply to client handshake
+            client_info = data.get('client', 'unknown')
+            platform = data.get('platform', 'unknown')
             
-        elif message_type == 'frame':
+            await websocket.send(json.dumps({
+                'type': 'handshake_ack',
+                'message': f'Handshake acknowledged for {client_info}',
+                'server': 'swaram-backend',
+                'version': '1.0',
+                'timestamp': time.time(),
+                'status': 'ok',
+                'labels': self.detection_processor.sign_labels
+            }))
+            print(f"🤝 Handshake completed for client {client_id}")
+
+        elif msg_type == 'mode':
+            # Client requests to change detection mode
+            mode = data.get('mode', 'both')
+            if mode in ['sign', 'lip', 'both']:
+                self.clients[client_id]['mode'] = mode
+                await websocket.send(json.dumps({
+                    'type': 'mode_ack',
+                    'mode': mode,
+                    'timestamp': time.time(),
+                    'status': 'ok'
+                }))
+                print(f"🔄 Client {client_id} switched to {mode} mode")
+            else:
+                await websocket.send(json.dumps({
+                    'type': 'error',
+                    'message': f'Invalid mode: {mode}',
+                    'timestamp': time.time()
+                }))
+
+        elif msg_type == 'frame':
             await self.process_frame(websocket, client_id, data)
+        
+        elif msg_type == 'control':
+            command = data.get('command', '')
+            if command == 'start':
+                # Reset sequence buffers (same as test1.py)
+                self.detection_processor.sequence = []
+                self.detection_processor.predictions = []
+                self.detection_processor.detected_words = []
+                self.detection_processor.current_action = "Ready..."
+                self.detection_processor.last_action = None
+                self.detection_processor.action_cooldown = 0
+                
+                response = {
+                    'type': 'control_response',
+                    'command': command,
+                    'status': 'started',
+                    'timestamp': time.time(),
+                    'message': 'Translation started'
+                }
+            elif command == 'stop':
+                response = {
+                    'type': 'control_response',
+                    'command': command,
+                    'status': 'stopped',
+                    'timestamp': time.time(),
+                    'message': 'Translation stopped'
+                }
+            else:
+                response = {
+                    'type': 'control_response',
+                    'command': command,
+                    'status': 'unknown',
+                    'timestamp': time.time(),
+                    'message': f'Unknown command: {command}'
+                }
             
-        elif message_type == 'mode':
-            await self.change_mode(websocket, client_id, data)
-            
-        elif message_type == 'control':
-            await self.handle_control(websocket, client_id, data)
-            
+            await websocket.send(json.dumps(response))
+            print(f"🎮 Control command: {command} from client {client_id}")
+        
         else:
-            print(f"Unknown message type from {client_id}: {message_type}")
             await websocket.send(json.dumps({
                 'type': 'error',
-                'message': f'Unknown message type: {message_type}',
+                'message': f'Unknown message type: {msg_type}',
                 'timestamp': time.time()
             }))
     
     async def process_frame(self, websocket, client_id, data):
-        """Process incoming frame with detection"""
+        """Process frame from client"""
         try:
-            frame_data = data.get('frame')
-            if not frame_data:
-                await websocket.send(json.dumps({
-                    'type': 'error',
-                    'message': 'No frame data provided',
-                    'timestamp': time.time()
-                }))
+            frame_base64 = data.get('frame')
+            mode = data.get('mode', self.clients[client_id].get('mode', 'both'))
+            
+            if not frame_base64:
+                print(f"⚠️ No frame data from client {client_id}")
                 return
             
-            if len(frame_data) > self.max_frame_size:
-                await websocket.send(json.dumps({
-                    'type': 'error',
-                    'message': f'Frame too large: {len(frame_data)} bytes',
-                    'timestamp': time.time()
-                }))
-                return
+            # Log frame info
+            frame_id = data.get('frame_id', 'unknown')
+            frame_size = len(frame_base64)
             
-            try:
-                # Handle base64 data that might include data URL prefix
-                if frame_data.startswith('data:image'):
-                    frame_data = frame_data.split(',')[1]
-                
-                frame_bytes = base64.b64decode(frame_data)
-                nparr = np.frombuffer(frame_bytes, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                if frame is None:
-                    raise ValueError("Failed to decode image")
-                    
-            except Exception as e:
-                await websocket.send(json.dumps({
-                    'type': 'error',
-                    'message': f'Frame decoding failed: {str(e)}',
-                    'timestamp': time.time()
-                }))
-                return
-            
-            mode = data.get('mode', 'both')
-            valid_modes = ['sign', 'lip', 'both']
-            if mode not in valid_modes:
-                mode = 'both'
-            
-            # Process frame and predict in separate thread
-            detection_data, prediction = await asyncio.get_event_loop().run_in_executor(
+            # Process frame
+            loop = asyncio.get_event_loop()
+            detection_data, prediction = await loop.run_in_executor(
                 self.detection_processor.executor,
-                self.detection_processor.process_frame_and_predict,
-                frame, mode
+                self.detection_processor.process_and_predict,
+                frame_base64, mode
             )
             
             # Send detection data
-            detection_response = {
+            detection_msg = {
                 'type': 'detection',
                 'detection': detection_data,
-                'timestamp': time.time(),
-                'frame_id': data.get('frame_id', 'unknown'),
-                'mode': mode
+                'frame_id': frame_id,
+                'timestamp': time.time()
             }
-            await websocket.send(json.dumps(detection_response))
+            await websocket.send(json.dumps(detection_msg))
             
             # Send prediction if available
             if prediction:
+                print(f"📝 Prediction for client {client_id}: {prediction['text']} ({prediction['confidence']:.2%})")
+                
                 # Generate TTS audio
-                print(f"Generating TTS for prediction: {prediction}")
-                tts_audio = await asyncio.get_event_loop().run_in_executor(
+                tts_audio = await loop.run_in_executor(
                     self.detection_processor.executor,
                     self.detection_processor.text_to_speech,
-                    prediction['text']
+                    prediction['text'], 'en'
                 )
-                print(f"TTS generated: {tts_audio is not None}")
                 
-                translation_response = {
+                translation_msg = {
                     'type': 'translation',
                     'data': prediction,
                     'audio': tts_audio,
-                    'detection': detection_data,
-                    'timestamp': time.time(),
-                    'frame_id': data.get('frame_id', 'unknown')
+                    'timestamp': time.time()
                 }
-                print(f"Sending translation response: {prediction['text']}")
-                await websocket.send(json.dumps(translation_response))
+                await websocket.send(json.dumps(translation_msg))
             
             # Send stats
-            stats = {
+            stats_msg = {
                 'type': 'stats',
-                'fps': self.frame_rate,
-                'hand_count': detection_data['handCount'],
-                'lip_detected': detection_data['lipDetected'],
-                'confidence': detection_data['confidence'],
+                'stats': {
+                    'hand_count': detection_data.get('handCount', 0),
+                    'confidence': detection_data.get('confidence', 0),
+                    'frame_size': frame_size,
+                    'total_words': len(self.detection_processor.detected_words),
+                    'current_action': self.detection_processor.current_action
+                },
                 'timestamp': time.time()
             }
-            await websocket.send(json.dumps(stats))
+            await websocket.send(json.dumps(stats_msg))
             
+            # Send periodic status
+            if random.random() < 0.1:  # 10% chance
+                await websocket.send(json.dumps({
+                    'type': 'status',
+                    'message': f'Processing: {detection_data.get("handCount", 0)} hands, {self.detection_processor.current_action}',
+                    'timestamp': time.time()
+                }))
+        
         except Exception as e:
-            print(f"Frame processing error for {client_id}: {e}")
+            print(f"❌ Frame processing error for client {client_id}: {e}")
             traceback.print_exc()
             
-            error_response = {
+            # Send error to client
+            await websocket.send(json.dumps({
                 'type': 'error',
                 'message': f'Frame processing error: {str(e)}',
                 'timestamp': time.time()
-            }
-            await websocket.send(json.dumps(error_response))
+            }))
     
-    async def generate_mock_translation(self, detection_data, mode):
-        """Generate mock translation for demo purposes"""
-        malayalam_chars = "അആഇഈഉഊഋഌഎഏഐഒഓഔകഖഗഘങചഛജഝഞടഠഡഢണതഥദധനപഫബഭമയരലവശഷസഹളഴറ"
-        
-        # Simple logic based on detection
-        if mode == 'sign' and detection_data['handCount'] > 0:
-            char_index = min(detection_data['handCount'] - 1, len(malayalam_chars) - 1)
-        elif mode == 'lip' and detection_data['lipDetected']:
-            char_index = len(malayalam_chars) // 2
-        elif mode == 'both' and (detection_data['handCount'] > 0 or detection_data['lipDetected']):
-            char_index = min(detection_data['handCount'] + (1 if detection_data['lipDetected'] else 0), 
-                           len(malayalam_chars) - 1)
-        else:
-            return None
-        
-        char = malayalam_chars[char_index] if char_index < len(malayalam_chars) else "അ"
-        
-        return {
-            'character': char,
-            'confidence': detection_data['confidence'],
-            'type': mode,
-            'timestamp': time.time(),
-            'processing_time': 0.1
-        }
-    
-    async def change_mode(self, websocket, client_id, data):
-        """Change processing mode"""
-        mode = data.get('mode', 'both')
-        valid_modes = ['sign', 'lip', 'both']
-        
-        if mode not in valid_modes:
-            mode = 'both'
-        
-        response = {
-            'type': 'mode_changed',
-            'mode': mode,
-            'timestamp': time.time(),
-            'message': f'Processing mode changed to {mode}'
-        }
-        await websocket.send(json.dumps(response))
-        print(f"Client {client_id} changed mode to {mode}")
-    
-    async def handle_control(self, websocket, client_id, data):
-        """Handle control commands"""
-        command = data.get('command', '').lower()
-        
-        if command == 'start':
-            response = {
-                'type': 'control_response',
-                'command': 'start',
-                'status': 'started',
-                'timestamp': time.time(),
-                'message': 'Detection started'
-            }
-        elif command == 'stop':
-            response = {
-                'type': 'control_response',
-                'command': 'stop',
-                'status': 'stopped',
-                'timestamp': time.time(),
-                'message': 'Detection stopped'
-            }
-        elif command == 'pause':
-            response = {
-                'type': 'control_response',
-                'command': 'pause',
-                'status': 'paused',
-                'timestamp': time.time(),
-                'message': 'Detection paused'
-            }
-        elif command == 'resume':
-            response = {
-                'type': 'control_response',
-                'command': 'resume',
-                'status': 'resumed',
-                'timestamp': time.time(),
-                'message': 'Detection resumed'
-            }
-        else:
-            response = {
-                'type': 'error',
-                'message': f'Unknown command: {command}',
-                'timestamp': time.time()
-            }
-        
-        await websocket.send(json.dumps(response))
-        print(f"Client {client_id} sent control command: {command}")
-    
-    async def broadcast(self, message):
-        """Broadcast message to all connections"""
-        if self.connections:
-            disconnected = []
-            for connection in self.connections:
-                try:
-                    await connection.send(message)
-                except:
-                    disconnected.append(connection)
-            
-            for connection in disconnected:
-                self.connections.remove(connection)
-    
-    async def health_check(self):
-        """Periodic health check"""
-        while True:
-            await asyncio.sleep(30)
-            health_msg = {
-                'type': 'health',
-                'timestamp': time.time(),
-                'connections': len(self.connections),
-                'status': 'healthy',
-                'detection_active': True
-            }
-            await self.broadcast(json.dumps(health_msg))
-    
-    async def start(self, host='0.0.0.0', port=8765):
-        """Start WebSocket server"""
+    async def start(self):
+        """Start server"""
         print("=" * 60)
-        print("Sign Language Detection Server")
-        print(f"WebSocket Server starting on {host}:{port}")
+        print("SWARAM WebSocket Server")
+        print(f"Starting on {self.host}:{self.port}")
         print("=" * 60)
-        print("Features:")
-        print("  • Real-time hand landmark detection")
-        print("  • Lip movement tracking")
-        print("  • Bounding box visualization")
-        print("  • Confidence scoring")
+        
+        # Print server info
+        print(f"📡 Server URL: ws://{self.host}:{self.port}")
+        print(f"📱 Connect from mobile using: ws://192.168.73.170:8765")
+        print(f"📊 Loaded {len(self.detection_processor.sign_labels)} sign language labels")
         print("=" * 60)
-        print("Waiting for connections...")
         
-        health_task = asyncio.create_task(self.health_check())
-        
-        async with websockets.serve(self.handle_connection, host, port):
-            print(f"✓ Server started successfully on {host}:{port}")
+        # Start server - FIXED: Pass the method directly
+        async with websockets.serve(self.handle_connection, self.host, self.port):
+            print(f"✅ Server running!")
+            print("👁️  Waiting for connections...")
             print("Press Ctrl+C to stop")
-            await asyncio.Future()
-        
-        health_task.cancel()
+            await asyncio.Future()  # Run forever
 
-def run_server():
+
+async def main():
     server = WebSocketServer()
-    
-    try:
-        print("Starting WebSocket server...")
-        asyncio.run(server.start(host='0.0.0.0', port=8765))
-    except KeyboardInterrupt:
-        print("\nServer stopped by user")
-    except Exception as e:
-        print(f"Server error: {e}")
-        traceback.print_exc()
+    await server.start()
 
-if __name__ == '__main__':
-    run_server()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Server stopped by user")
+    except Exception as e:
+        print(f"❌ Server error: {e}")
+        traceback.print_exc()

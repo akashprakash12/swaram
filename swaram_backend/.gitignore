@@ -37,9 +37,8 @@ expo-env.d.ts
 # Python
 #################################
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 .Python
 .pytest_cache/
 
@@ -53,36 +52,60 @@ ENV/
 swaram_backend/venv/
 
 #################################
-# ML / AI Models (VERY IMPORTANT)
+# ML / AI Models & Data (CRITICAL)
 #################################
 *.h5
 *.pt
 *.onnx
 *.ckpt
+*.pb
+*.tflite
+*.joblib
+*.pickle
+*.pkl
+
+# Model & dataset folders
 models/
 swaram_backend/models/
+augmented_data/
+augmented_data_new/
+dataset/
+data/
 
 #################################
 # Logs & Debug
 #################################
 *.log
 debug.log
+logs/
+*.out
+
+#################################
+# Temporary / Cache
+#################################
+.cache/
+tmp/
+temp/
 
 #################################
 # Docker
 #################################
 docker-compose.override.yml
 *.tar
+*.tar.gz
 
 #################################
 # OS Files
 #################################
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
 
 #################################
-# IDEs
+# IDEs / Editors
 #################################
 .vscode/
 .idea/
-*.swp
+*.iml
+*.code-workspace

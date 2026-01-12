@@ -1,5 +1,5 @@
-// src/screens/HomeScreen.js
-import React, { useState, useRef, useEffect } from 'react';
+// src/screens/HomeScreen.js - FIXED SIMPLIFIED VERSION
+import React, { useState, useEffect, useRef } from "react";
 import {
   View,
   Text,
@@ -9,576 +9,251 @@ import {
   Dimensions,
   Animated,
   Alert,
-  Linking,
-  Platform,
   StatusBar,
-  AppState,
   ActivityIndicator,
-  Modal,
-} from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { Card, IconButton, ProgressBar, Chip } from 'react-native-paper';
-import { Audio } from 'expo-audio';
-import colors from '../constants/colors';
-import CameraFullScreen from './CameraFullScreen';
-import WebSocketService from '../services/WebSocketService';
-import CameraService from '../services/CameraService';
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { Card, Chip } from "react-native-paper";
+import Icon from "react-native-vector-icons/MaterialCommunityIcons";
 
-const { width, height } = Dimensions.get('window');
+// Services
+import WebSocketService from "../services/WebSocketService";
+import CameraService from "../services/CameraService";
+
+// Components
+import CameraFullScreen from "./CameraFullScreen";
+
+const { width } = Dimensions.get("window");
 
 export default function HomeScreen({ navigation }) {
-  // State management
+  // State
   const [isRecording, setIsRecording] = useState(false);
-  const [isTranslating, setIsTranslating] = useState(false);
-  const [translationMode, setTranslationMode] = useState('both');
-  const [liveTranslation, setLiveTranslation] = useState('');
+  const [translationMode, setTranslationMode] = useState("both");
+  const [liveTranslation, setLiveTranslation] = useState("");
   const [translationHistory, setTranslationHistory] = useState([]);
   const [processingStats, setProcessingStats] = useState({
-    latency: '0ms',
-    accuracy: '0%',
-    wordsProcessed: 0,
-    fps: 0,
+    latency: "0ms",
+    confidence: "0%",
+    framesSent: 0,
     handCount: 0,
-    lipDetected: false,
   });
-  const [cameraActive, setCameraActive] = useState(true);
   const [showCameraFullScreen, setShowCameraFullScreen] = useState(false);
-const [cameraTranslationText, setCameraTranslationText] = useState('');
   const [isConnected, setIsConnected] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
-  const [serverIp, setServerIp] = useState('192.168.207.170');
-  const [connectionStatus, setConnectionStatus] = useState('disconnected');
-  const [lastError, setLastError] = useState('');
+  const [serverIp, setServerIp] = useState("192.168.73.170");
+  const [connectionStatus, setConnectionStatus] = useState("disconnected");
   const [cameraPermission, setCameraPermission] = useState(null);
-  const [showPermissionDialog, setShowPermissionDialog] = useState(false);
   const [detectionData, setDetectionData] = useState(null);
-  const [translationResult, setTranslationResult] = useState(null);
-  const [cameraReady, setCameraReady] = useState(false);
 
   // Refs
   const pulseAnim = useRef(new Animated.Value(1)).current;
-  const translateBtnScale = useRef(new Animated.Value(1)).current;
-  const translationBuffer = useRef('');
-  const statsRef = useRef({
-    startTime: 0,
-    frameCount: 0,
-    totalLatency: 0,
-  });
-  const reconnectTimeout = useRef(null);
+  const frameCountRef = useRef(0);
 
-  // Initialize services
+  // Initialize
   useEffect(() => {
-    initializeServices();
-    checkCameraPermission();
-    
-    // Set up WebSocket callbacks
-    WebSocketService.setOnTranslation(handleTranslation);
-    WebSocketService.setOnStats(handleStats);
-    WebSocketService.setOnError(handleError);
-    WebSocketService.setOnConnected(handleConnected);
-    WebSocketService.setOnDisconnected(handleDisconnected);
-    WebSocketService.setOnConnecting(handleConnecting);
-    WebSocketService.setOnDetection(handleDetection);
-    WebSocketService.setOnControlResponse(handleControlResponse);
-    
-    // Handle app state changes
-    const subscription = AppState.addEventListener('change', handleAppStateChange);
-    
+    initializeApp();
+
     return () => {
-      subscription.remove();
-      cleanupServices();
-      if (reconnectTimeout.current) {
-        clearTimeout(reconnectTimeout.current);
-      }
+      cleanup();
     };
   }, []);
 
-  const checkCameraPermission = async () => {
+  const initializeApp = async () => {
     try {
-      if (!CameraService.permissionRequested) {
-        const granted = await CameraService.initialize();
-        setCameraPermission(granted);
-        setCameraActive(granted);
-        
-        if (!granted) {
-          setTimeout(() => {
-            setShowPermissionDialog(true);
-          }, 1000);
-        }
+      // Check camera permission
+      const hasPermission = await CameraService.checkPermission();
+      setCameraPermission(hasPermission);
+
+      // Setup WebSocket callbacks
+      setupWebSocketCallbacks();
+
+      // Connect to server
+      connectToServer();
+    } catch (error) {
+      console.error("Initialization error:", error);
+      Alert.alert("Error", "Failed to initialize app");
+    }
+  };
+
+  const setupWebSocketCallbacks = () => {
+    WebSocketService.setOnConnected((url) => {
+      console.log("Connected to:", url);
+
+      setIsConnected(true);
+      setConnectionStatus("connected");
+
+      if (typeof url === "string") {
+        setServerIp(url.replace("ws://", "").replace(":8765", ""));
       } else {
-        const hasPermission = await CameraService.checkPermission();
-        setCameraPermission(hasPermission);
-        setCameraActive(hasPermission);
+        console.warn("WebSocket connected but URL is undefined");
       }
-    } catch (error) {
-      console.error('Error checking permission:', error);
-      setCameraPermission(false);
-      setCameraActive(false);
-    }
-  };
+    });
 
-const handleDetection = (data) => {
-  console.log('Detection data received:', {
-    type: data.type,
-    detection: data.detection,
-    hasTranslation: !!data.data
-  });
-
-  if (data.detection) {
-    setDetectionData(data.detection);
-    
-    // Update stats with detection info
-    setProcessingStats(prev => ({
-      ...prev,
-      handCount: data.detection.handCount || 0,
-      lipDetected: data.detection.lipDetected || false,
-      accuracy: `${Math.round((data.detection.confidence || 0) * 100)}%`
-    }));
-  }
-
-  // Handle translation if available
-  if (data.data?.character) {
-    setLiveTranslation(prev => prev + data.data.character);
-    setTranslationResult(data.data);
-    
-    // Update translation buffer for full-screen camera
-    setCameraTranslationText(prev => prev + data.data.character);
-    
-    const historyItem = {
-      id: Date.now().toString(),
-      text: data.data.character,
-      mode: data.data.type || translationMode,
-      timestamp: new Date().toLocaleTimeString(),
-      confidence: Math.round((data.data.confidence || 0.5) * 100),
-      processingTime: data.data.processing_time?.toFixed(2) || '0.00',
-    };
-    
-    setTranslationHistory(prev => [historyItem, ...prev.slice(0, 9)]);
-    
-    setIsProcessing(true);
-    setTimeout(() => setIsProcessing(false), 300);
-  }
-};
-  const handleControlResponse = (data) => {
-    console.log('Control response:', data);
-    if (data.command === 'start' && data.status === 'started') {
-      setIsProcessing(true);
-    } else if (data.command === 'stop' && data.status === 'stopped') {
-      setIsProcessing(false);
-    }
-  };
-
-  const requestCameraPermission = async () => {
-    try {
-      const granted = await CameraService.initialize();
-      setCameraPermission(granted);
-      setCameraActive(granted);
-      
-      if (!granted) {
-        setShowPermissionDialog(true);
+    WebSocketService.setOnDisconnected(() => {
+      setIsConnected(false);
+      setConnectionStatus("disconnected");
+      if (isRecording) {
+        stopTranslation();
+        Alert.alert("Disconnected", "Lost connection to server");
       }
-    } catch (error) {
-      console.error('Permission request error:', error);
-      setCameraPermission(false);
-      setCameraActive(false);
-    }
-  };
+    });
 
-  const handleRequestCameraPermission = async () => {
-    setShowPermissionDialog(false);
-    const granted = await CameraService.requestPermissionWithExplanation();
-    setCameraPermission(granted);
-    setCameraActive(granted);
-    
-    if (granted) {
-      Alert.alert(
-        'Camera Enabled',
-        'Camera permission granted. You can now use the full-screen camera.',
-        [{ text: 'OK' }]
-      );
-    } else {
-      Alert.alert(
-        'Camera Permission Denied',
-        'To use camera features, you need to enable camera permission in your device settings.',
-        [
-          { 
-            text: 'Open Settings', 
-            onPress: () => {
-              if (Platform.OS === 'ios') {
-                Linking.openURL('app-settings:');
-              } else {
-                Linking.openSettings();
-              }
-            }
-          },
-          { 
-            text: 'Cancel', 
-            style: 'cancel' 
-          }
-        ]
-      );
-    }
-  };
+    WebSocketService.setOnConnecting(() => {
+      setIsConnecting(true);
+      setConnectionStatus("connecting");
+    });
 
-  const initializeServices = async () => {
-    try {
-      const savedIp = await loadServerIp();
-      if (savedIp) {
-        setServerIp(savedIp);
-      }
-      
-      await attemptConnection();
-      
-    } catch (error) {
-      console.error('Initialization error:', error);
-      setLastError(error.message);
-    }
-  };
+    WebSocketService.setOnError((error) => {
+      console.error("WebSocket error:", error);
+      Alert.alert("Connection Error", error);
+    });
 
-  const loadServerIp = async () => {
-    // TODO: Load from AsyncStorage
-    return null;
-  };
-
-  const saveServerIp = async (ip) => {
-    // TODO: Save to AsyncStorage
-    setServerIp(ip);
-  };
-
-  const attemptConnection = async () => {
-    if (isConnecting) return;
-    
-    setIsConnecting(true);
-    setConnectionStatus('connecting');
-    setLastError('');
-    
-    try {
-      await WebSocketService.connect(`ws://${serverIp}:8765`);
-    } catch (error) {
-      console.error('Connection error:', error);
-      setLastError(error.message);
-      setConnectionStatus('disconnected');
-      
-      Alert.alert(
-        'Connection Failed',
-        `Could not connect to server at ${serverIp}:8765\n\nError: ${error.message}\n\nPlease check:\n1. Server is running\n2. Correct IP address\n3. Both devices on same WiFi`,
-        [
-          { 
-            text: 'Retry', 
-            onPress: () => {
-              setTimeout(attemptConnection, 1000);
-            }
-          },
-          { 
-            text: 'Change IP', 
-            onPress: showIpDialog 
-          },
-          { 
-            text: 'Continue Offline', 
-            style: 'cancel' 
-          }
-        ]
-      );
-    } finally {
-      setIsConnecting(false);
-    }
-  };
-
-  const handleConnecting = (url) => {
-    console.log(`Connecting to: ${url}`);
-    setConnectionStatus('connecting');
-  };
-
-  const handleConnected = (url) => {
-    console.log(`Connected to: ${url}`);
-    setIsConnected(true);
-    setConnectionStatus('connected');
-    setLastError('');
-    
-    Alert.alert('Connected', `Successfully connected to:\n${url}`);
-  };
-
-  const handleDisconnected = (code, reason) => {
-    console.log(`Disconnected: ${code} - ${reason}`);
-    setIsConnected(false);
-    setConnectionStatus('disconnected');
-    
-    if (isRecording) {
-      stopTranslation();
-      Alert.alert(
-        'Connection Lost',
-        'Server connection lost. Translation stopped.',
-        [{ text: 'OK' }]
-      );
-    }
-    
-    reconnectTimeout.current = setTimeout(() => {
-      if (!isConnected) {
-        console.log('Attempting auto-reconnect...');
-        attemptConnection();
-      }
-    }, 5000);
-  };
-
-  const handleAppStateChange = (nextAppState) => {
-    if (nextAppState === 'background') {
-      CameraService.stopStreaming();
-    } else if (nextAppState === 'active' && isRecording) {
-      startStreaming();
-    }
-  };
-
-  const handleTranslation = (data) => {
-    console.log('Translation received:', data);
-    if (data.data?.text) {
-      const translationText = data.data.text;
-      translationBuffer.current += translationText;
-      
-      setLiveTranslation(prev => prev + translationText);
-      setTranslationResult(data.data);
-      
-      // Play audio if available
-      if (data.audio) {
-        console.log('Playing audio:', data.audio);
-        playAudio(data.audio);
-      } else {
-        console.log('No audio data in translation');
-      }
-      
-      const historyItem = {
-        id: Date.now().toString(),
-        text: translationText,
-        mode: data.data.type || translationMode,
-        timestamp: new Date().toLocaleTimeString(),
-        confidence: Math.round((data.data.confidence || 0.5) * 100),
-        processingTime: data.processing_time?.toFixed(2) || '0.00',
-      };
-      
-      setTranslationHistory(prev => [historyItem, ...prev.slice(0, 9)]);
-      
-      setProcessingStats(prev => ({
-        ...prev,
-        accuracy: `${Math.round((data.data.confidence || 0.5) * 100)}%`,
-        wordsProcessed: prev.wordsProcessed + 1,
-      }));
-
-      setIsProcessing(true);
-      setTimeout(() => setIsProcessing(false), 300);
-    }
-  };
-
-  const handleStats = (stats) => {
-    setProcessingStats(prev => ({
-      ...prev,
-      latency: `${Math.round((stats.latency || 0) * 1000)}ms`,
-      fps: stats.fps || 0,
-    }));
-  };
-
-  const handleError = (error) => {
-    console.error('WebSocket error:', error);
-    setLastError(error);
-  };
-
-  const playAudio = async (audioData) => {
-    try {
-      console.log('playAudio called with:', audioData);
-      if (!audioData?.audio) {
-        console.log('No audio data provided');
-        return;
-      }
-
-      console.log('Setting audio mode...');
-      // Set audio mode for playback
-      await Audio.setAudioModeAsync({
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-        shouldDuckAndroid: true,
-      });
-
-      console.log('Creating sound object...');
-      // Create sound object from base64 data
-      const soundObject = new Audio.Sound();
-      const uri = `data:audio/mp3;base64,${audioData.audio}`;
-      console.log('Loading audio from URI (first 50 chars):', uri.substring(0, 50));
-      
-      await soundObject.loadAsync({ uri });
-
-      console.log('Playing audio...');
-      // Play the audio
-      await soundObject.playAsync();
-
-      // Unload after playing
-      soundObject.setOnPlaybackStatusUpdate((status) => {
-        console.log('Playback status:', status);
-        if (status.didJustFinish) {
-          console.log('Audio finished playing, unloading...');
-          soundObject.unloadAsync();
-        }
-      });
-
-    } catch (error) {
-      console.error('Audio playback error:', error);
-    }
-  };
-
-  const getLocalIP = () => {
-    // This is a simple way to suggest the local IP
-    // In a real app, you might want to use a network discovery library
-    return '192.168.110.170'; // Current network IP
-  };
-
-  const autoDetectIP = () => {
-    const suggestedIP = getLocalIP();
-    setServerIp(suggestedIP);
-    Alert.alert(
-      'IP Address Detected',
-      `Suggested IP: ${suggestedIP}\n\nMake sure your computer and phone are on the same WiFi network.`,
-      [{ text: 'OK' }]
-    );
-  };
-
-// In HomeScreen.js, update the startStreaming function
-const startStreaming = () => {
-  if (!isConnected) {
-    Alert.alert('Not Connected', 'Please connect to processing server first');
-    return;
-  }
-
-  if (!cameraPermission) {
-    Alert.alert(
-      'Camera Permission Required',
-      'Please enable camera permission to start translation.',
-      [
-        { text: 'Enable Camera', onPress: requestCameraPermission },
-        { text: 'Cancel', style: 'cancel' }
-      ]
-    );
-    return;
-  }
-
-  if (!cameraReady) {
-    Alert.alert('Camera Not Ready', 'Please wait for camera to initialize');
-    return;
-  }
-
-  // Start pulse animation for recording indicator
-  Animated.loop(
-    Animated.sequence([
-      Animated.timing(pulseAnim, {
-        toValue: 1.2,
-        duration: 800,
-        useNativeDriver: true,
-      }),
-      Animated.timing(pulseAnim, {
-        toValue: 1,
-        duration: 800,
-        useNativeDriver: true,
-      }),
-    ])
-  ).start();
-
-  statsRef.current = {
-    startTime: Date.now(),
-    frameCount: 0,
-    totalLatency: 0,
-  };
-
-  // Start camera streaming
-  setTimeout(() => {
-    CameraService.startStreaming(
-      (frameBase64) => {
-        // This callback is called for each frame sent
-        statsRef.current.frameCount++;
-        
-        // Update FPS in stats
-        const duration = (Date.now() - statsRef.current.startTime) / 1000;
-        const currentFPS = Math.round(statsRef.current.frameCount / duration);
-        
-        setProcessingStats(prev => ({
+    WebSocketService.setOnDetection((data) => {
+      if (data.detection) {
+        setDetectionData(data.detection);
+        setProcessingStats((prev) => ({
           ...prev,
-          fps: currentFPS,
-          wordsProcessed: statsRef.current.frameCount,
+          handCount: data.detection.handCount || 0,
+          confidence: `${Math.round((data.detection.confidence || 0) * 100)}%`,
+        }));
+      }
+    });
+
+    WebSocketService.setOnTranslation((data) => {
+      if (data.data?.text) {
+        const text = data.data.text;
+        setLiveTranslation((prev) => prev + " " + text);
+
+        // Add to history
+        setTranslationHistory((prev) => [
+          {
+            id: Date.now().toString(),
+            text: text,
+            confidence: Math.round((data.data.confidence || 0) * 100),
+            timestamp: new Date().toLocaleTimeString(),
+          },
+          ...prev.slice(0, 9),
+        ]);
+
+        // Update stats
+        frameCountRef.current++;
+        setProcessingStats((prev) => ({
+          ...prev,
+          framesSent: frameCountRef.current,
+          confidence: `${Math.round((data.data.confidence || 0) * 100)}%`,
+        }));
+      }
+    });
+
+    WebSocketService.setOnStatus((data) => {
+      console.log("Status:", data.message);
+    });
+
+    WebSocketService.setOnWelcome((data) => {
+      console.log("Server welcome:", data.message);
+    });
+  };
+
+  const connectToServer = () => {
+    setIsConnecting(true);
+
+    WebSocketService.connect(`ws://${serverIp}:8765`)
+      .then(() => {
+        console.log("Connection successful");
+      })
+      .catch((error) => {
+        console.error("Connection failed:", error);
+        Alert.alert(
+          "Connection Failed",
+          `Could not connect to ${serverIp}:8765\n\nMake sure the server is running.`,
+          [
+            { text: "Retry", onPress: connectToServer },
+            { text: "Change IP", onPress: showIpDialog },
+          ]
+        );
+      })
+      .finally(() => {
+        setIsConnecting(false);
+      });
+  };
+
+  const showIpDialog = () => {
+    Alert.prompt(
+      "Server IP",
+      "Enter server IP address:",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Connect",
+          onPress: (ip) => {
+            if (ip) {
+              setServerIp(ip);
+              setTimeout(connectToServer, 500);
+            }
+          },
+        },
+      ],
+      "plain-text",
+      serverIp
+    );
+  };
+
+  const startTranslation = () => {
+    if (!isConnected) {
+      Alert.alert("Not Connected", "Please connect to server first");
+      return;
+    }
+
+    if (!cameraPermission) {
+      Alert.alert("Camera Required", "Please enable camera permission");
+      return;
+    }
+
+    setIsRecording(true);
+    frameCountRef.current = 0;
+
+    // Start pulse animation
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, {
+          toValue: 1.2,
+          duration: 800,
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulseAnim, {
+          toValue: 1,
+          duration: 800,
+          useNativeDriver: true,
+        }),
+      ])
+    ).start();
+
+    // Start streaming
+    CameraService.startStreaming(
+      () => {
+        // Frame sent callback
+        frameCountRef.current++;
+        setProcessingStats((prev) => ({
+          ...prev,
+          framesSent: frameCountRef.current,
         }));
       },
-      10, // Reduced frame rate for mobile devices
-      translationMode // Mode
+      5,
+      translationMode
     );
-  }, 500); // Small delay to ensure camera is ready
 
-  // Send control command to server
-  WebSocketService.sendControl('start');
-  
-  console.log('Streaming started to server');
-};
-
-
-  const stopStreaming = () => {
-    CameraService.stopStreaming();
-    WebSocketService.sendControl('stop');
-    pulseAnim.stopAnimation();
-    
-    const duration = (Date.now() - statsRef.current.startTime) / 1000;
-    const avgFPS = statsRef.current.frameCount / duration;
-    
-    setProcessingStats(prev => ({
-      ...prev,
-      fps: Math.round(avgFPS),
-    }));
+    // Send control command
+    WebSocketService.sendControl("start");
   };
-
-// Also update the startTranslation function
-const startTranslation = () => {
-  if (!isConnected) {
-    Alert.alert('Not Connected', 'Please wait for server connection');
-    return;
-  }
-
-  if (!cameraPermission) {
-    Alert.alert(
-      'Camera Required',
-      'Please enable camera permission for translation',
-      [
-        { text: 'Enable Camera', onPress: requestCameraPermission },
-        { text: 'Cancel', style: 'cancel' }
-      ]
-    );
-    return;
-  }
-
-  setIsRecording(true);
-  setIsTranslating(true);
-  setLiveTranslation('');
-  translationBuffer.current = '';
-  
-  // Button press animation
-  Animated.sequence([
-    Animated.timing(translateBtnScale, {
-      toValue: 0.95,
-      duration: 100,
-      useNativeDriver: true,
-    }),
-    Animated.spring(translateBtnScale, {
-      toValue: 1,
-      tension: 50,
-      friction: 7,
-      useNativeDriver: true,
-    }),
-  ]).start();
-
-  startStreaming();
-};
 
   const stopTranslation = () => {
     setIsRecording(false);
-    setIsTranslating(false);
-    setIsProcessing(false);
-    setDetectionData(null);
-    stopStreaming();
+    CameraService.stopStreaming();
+    WebSocketService.sendControl("stop");
+    pulseAnim.stopAnimation();
   };
 
-  const handleStartTranslation = () => {
+  const handleToggleTranslation = () => {
     if (isRecording) {
       stopTranslation();
     } else {
@@ -587,505 +262,253 @@ const startTranslation = () => {
   };
 
   const handleClearTranslation = () => {
-    setLiveTranslation('');
+    setLiveTranslation("");
     setTranslationHistory([]);
-    translationBuffer.current = '';
     setDetectionData(null);
-    setTranslationResult(null);
+    frameCountRef.current = 0;
     setProcessingStats({
-      latency: '0ms',
-      accuracy: '0%',
-      wordsProcessed: 0,
-      fps: 0,
+      latency: "0ms",
+      confidence: "0%",
+      framesSent: 0,
       handCount: 0,
-      lipDetected: false,
     });
   };
 
   const handleModeChange = (mode) => {
     if (isRecording) {
-      Alert.alert(
-        'Stop Recording First',
-        'Please stop current translation before changing mode',
-        [{ text: 'OK' }]
-      );
+      Alert.alert("Stop First", "Stop translation before changing mode");
       return;
     }
-    
     setTranslationMode(mode);
-    setLiveTranslation('');
-    setDetectionData(null);
     WebSocketService.changeMode(mode);
   };
 
-  const showIpDialog = () => {
-    Alert.alert(
-      'Server Connection',
-      `Current IP: ${serverIp}\n\nChoose an option:`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Auto Detect',
-          onPress: () => {
-            autoDetectIP();
-            setTimeout(attemptConnection, 500);
-          }
-        },
-        {
-          text: 'Manual Entry',
-          onPress: () => {
-            Alert.prompt(
-              'Enter Server IP',
-              'Enter the IP address of your server:',
-              [
-                { text: 'Cancel', style: 'cancel' },
-                {
-                  text: 'Save',
-                  onPress: (ip) => {
-                    if (ip && ip.trim()) {
-                      saveServerIp(ip.trim());
-                      setTimeout(attemptConnection, 500);
-                    }
-                  }
-                }
-              ],
-              'plain-text',
-              serverIp
-            );
-          }
-        }
-      ]
-    );
+  const handleOpenCamera = () => {
+    if (!isConnected) {
+      Alert.alert("Not Connected", "Connect to server first");
+      return;
+    }
+    setShowCameraFullScreen(true);
   };
 
-  const cleanupServices = () => {
+  const cleanup = () => {
     WebSocketService.disconnect();
     CameraService.stopStreaming();
   };
 
-  const renderModeChip = (mode, label) => (
-    <TouchableOpacity
-      onPress={() => handleModeChange(mode)}
-      disabled={isRecording || isConnecting}
-    >
-      <Chip
-        mode="outlined"
-        selected={translationMode === mode}
-        style={[
-          styles.modeChip,
-          translationMode === mode && styles.modeChipActive,
-          (isRecording || isConnecting) && styles.disabledChip
-        ]}
-        textStyle={[
-          styles.modeChipText,
-          translationMode === mode && styles.modeChipTextActive
-        ]}
-      >
-        {label}
-      </Chip>
-    </TouchableOpacity>
-  );
-
-  const handleFullScreenCamera = () => {
-    if (!isConnected) {
-      Alert.alert('Not Connected', 'Please connect to server first');
-      return;
-    }
-    
-    if (!cameraPermission) {
-      requestCameraPermission();
-      return;
-    }
-    
-    setShowCameraFullScreen(true);
-  };
-
-  const getConnectionStatusColor = () => {
+  const getStatusColor = () => {
     switch (connectionStatus) {
-      case 'connected': return colors.success;
-      case 'connecting': return colors.warning;
-      case 'disconnected': return colors.danger;
-      default: return colors.textSecondary;
+      case "connected":
+        return "#4CAF50";
+      case "connecting":
+        return "#FF9800";
+      case "disconnected":
+        return "#F44336";
+      default:
+        return "#9E9E9E";
     }
   };
 
-  const getConnectionStatusText = () => {
+  const getStatusText = () => {
     switch (connectionStatus) {
-      case 'connected': return 'Connected';
-      case 'connecting': return 'Connecting...';
-      case 'disconnected': return 'Disconnected';
-      default: return 'Unknown';
+      case "connected":
+        return "Connected";
+      case "connecting":
+        return "Connecting...";
+      case "disconnected":
+        return "Disconnected";
+      default:
+        return "Unknown";
     }
-  };
-
-  const getCameraPermissionText = () => {
-    if (cameraPermission === null) return 'Checking...';
-    if (cameraPermission === true) return 'Camera Enabled';
-    return 'Camera Disabled';
-  };
-
-  const getCameraPermissionColor = () => {
-    if (cameraPermission === null) return colors.textSecondary;
-    if (cameraPermission === true) return colors.success;
-    return colors.danger;
-  };
-
-  const getDetectionStatus = () => {
-    if (!detectionData) return 'Waiting for detection...';
-    
-    let status = [];
-    if (detectionData.handCount > 0) {
-      status.push(`${detectionData.handCount} hand${detectionData.handCount > 1 ? 's' : ''}`);
-    }
-    if (detectionData.lipDetected) {
-      status.push('lips');
-    }
-    
-    return status.length > 0 
-      ? `Detected: ${status.join(', ')}` 
-      : 'No detection';
   };
 
   return (
-    <SafeAreaView style={styles.container} edges={['top']}>
+    <SafeAreaView style={styles.container}>
       <StatusBar backgroundColor="#FFFFFF" barStyle="dark-content" />
-      
-      <View style={[
-        styles.connectionBar, 
-        { backgroundColor: `${getConnectionStatusColor()}15` }
-      ]}>
-        <View style={styles.connectionStatus}>
+
+      {/* Connection Status */}
+      <View
+        style={[styles.statusBar, { backgroundColor: `${getStatusColor()}20` }]}
+      >
+        <View style={styles.statusContent}>
           {isConnecting ? (
-            <ActivityIndicator size="small" color={colors.warning} />
+            <ActivityIndicator size="small" color={getStatusColor()} />
           ) : (
-            <View style={[
-              styles.connectionDot,
-              { backgroundColor: getConnectionStatusColor() }
-            ]} />
+            <View
+              style={[styles.statusDot, { backgroundColor: getStatusColor() }]}
+            />
           )}
-          <Text style={styles.connectionText}>
-            {getConnectionStatusText()} to {serverIp}:8765
+          <Text style={styles.statusText}>
+            {getStatusText()} • {serverIp}
           </Text>
-          <TouchableOpacity onPress={showIpDialog} style={styles.changeIpButton}>
+          <TouchableOpacity onPress={showIpDialog} style={styles.changeIpBtn}>
             <Text style={styles.changeIpText}>Change IP</Text>
           </TouchableOpacity>
         </View>
-        
-        {lastError ? (
-          <Text style={styles.errorText} numberOfLines={2}>
-            Error: {lastError}
-          </Text>
-        ) : (
-          <Text style={styles.connectionSubtext}>
-            {isConnected 
-              ? 'Real-time detection active' 
-              : isConnecting
-                ? 'Attempting to connect...'
-                : 'Tap "Change IP" to update server address'}
-          </Text>
-        )}
       </View>
-      
+
+      {/* Header */}
       <View style={styles.header}>
         <View>
-          <Text style={styles.appName}>SWARAM</Text>
-          <Text style={styles.appTagline}>Real-time Sign Language Translator</Text>
+          <Text style={styles.title}>SWARAM</Text>
+          <Text style={styles.subtitle}>Sign Language Translator</Text>
         </View>
-        <View style={styles.headerRight}>
-          <IconButton
-            icon="cog"
-            size={24}
-            onPress={() => navigation.navigate('Settings')}
-            disabled={isConnecting}
-          />
-          <View style={[
-            styles.localBadge, 
-            { backgroundColor: `${getConnectionStatusColor()}20` }
-          ]}>
-            <Text style={[
-              styles.localBadgeText,
-              { color: getConnectionStatusColor() }
-            ]}>
-              {connectionStatus.toUpperCase()}
-            </Text>
-          </View>
-        </View>
+        <TouchableOpacity onPress={() => navigation.navigate("Settings")}>
+          <Icon name="cog" size={28} color="#333" />
+        </TouchableOpacity>
       </View>
 
-      <ScrollView 
-        style={styles.scrollView}
-        showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.scrollContent}
-      >
+      <ScrollView style={styles.scrollView}>
+        {/* Camera Section */}
         <View style={styles.cameraSection}>
-          {cameraPermission === false ? (
-            <TouchableOpacity 
-              style={[styles.cameraPlaceholder, styles.cameraPermissionPlaceholder]}
-              onPress={requestCameraPermission}
-              activeOpacity={0.8}
-            >
-              <Text style={styles.permissionIcon}>CAMERA</Text>
-              <Text style={styles.permissionTitle}>Camera Disabled</Text>
-              <Text style={styles.permissionText}>
-                Tap to enable camera for sign language translation
+          <TouchableOpacity
+            style={styles.cameraCard}
+            onPress={handleOpenCamera}
+            disabled={!isConnected || isConnecting}
+          >
+            <View style={styles.cameraContent}>
+              {isRecording && (
+                <Animated.View
+                  style={[
+                    styles.recordingDot,
+                    { transform: [{ scale: pulseAnim }] },
+                  ]}
+                />
+              )}
+
+              <Icon
+                name={cameraPermission ? "camera" : "camera-off"}
+                size={40}
+                color={cameraPermission ? "#4CAF50" : "#F44336"}
+              />
+
+              <Text style={styles.cameraTitle}>
+                {isRecording ? "Recording..." : "Camera Ready"}
               </Text>
-              <View style={styles.permissionButton}>
-                <Text style={styles.permissionButtonText}>ENABLE CAMERA</Text>
-              </View>
-            </TouchableOpacity>
-          ) : cameraPermission === null ? (
-            <View style={[styles.cameraPlaceholder, styles.cameraCheckingPlaceholder]}>
-              <ActivityIndicator size="large" color={colors.primary} />
-              <Text style={styles.checkingText}>Checking camera permission...</Text>
+
+              <Text style={styles.cameraSubtitle}>
+                {isConnected ? "Tap to open camera" : "Connect to server"}
+              </Text>
             </View>
-          ) : (
-            <TouchableOpacity 
-              style={[
-                styles.cameraPlaceholder,
-                (!isConnected || isConnecting) && styles.cameraPlaceholderDisabled
-              ]}
-              onPress={handleFullScreenCamera}
-              activeOpacity={0.8}
-              disabled={!isConnected || isConnecting}
-            >
-              {cameraActive ? (
-                <>
-                  {isTranslating && (
-                    <Animated.View 
-                      style={[
-                        styles.cameraActiveIndicator,
-                        { transform: [{ scale: pulseAnim }] }
-                      ]} 
-                    />
-                  )}
-                  <Text style={styles.cameraText}>
-                    {translationMode === 'sign' ? 'Sign Language Mode' :
-                     translationMode === 'lip' ? 'Lip Reading Mode' :
-                     'Hybrid Mode'}
-                  </Text>
-                  
-                  <View style={styles.cameraStatus}>
-                    <View style={styles.statusIndicator}>
-                      <View style={[
-                        styles.statusDot,
-                        { backgroundColor: getConnectionStatusColor() }
-                      ]} />
-                      <Text style={styles.cameraStatusText}>
-                        {getConnectionStatusText()}
-                      </Text>
-                    </View>
-                    
-                    {detectionData && (
-                      <Text style={styles.detectionText}>
-                        {getDetectionStatus()}
-                      </Text>
-                    )}
-                    
-                    {isProcessing && (
-                      <Text style={styles.processingText}>Processing...</Text>
-                    )}
-                  </View>
-                  
-                  <Text style={styles.cameraHint}>
-                    {isTranslating 
-                      ? 'Real-time detection active. Make clear signs/lip movements'
-                      : 'Tap to open full-screen camera with detection overlay'}
-                  </Text>
-                </>
-              ) : (
-                <>
-                  <Text style={styles.cameraEnableText}>Camera Ready</Text>
-                  <Text style={styles.cameraHint}>
-                    {isConnected ? 'Tap to open full screen with detection' : 'Connect to server first'}
-                  </Text>
-                </>
-              )}
-              
-              {isConnecting && (
-                <View style={styles.connectingOverlay}>
-                  <ActivityIndicator size="large" color={colors.primary} />
-                  <Text style={styles.connectingText}>Connecting to server...</Text>
-                </View>
-              )}
-            </TouchableOpacity>
-          )}
-          
-          <View style={styles.modeContainer}>
+          </TouchableOpacity>
+
+          {/* Mode Selection */}
+          <View style={styles.modeSection}>
             <Text style={styles.modeLabel}>Translation Mode:</Text>
-            <View style={styles.modeChips}>
-              {renderModeChip('sign', 'Sign Only')}
-              {renderModeChip('lip', 'Lip Only')}
-              {renderModeChip('both', 'Hybrid')}
+            <View style={styles.modeButtons}>
+              {["sign", "lip", "both"].map((mode) => (
+                <TouchableOpacity
+                  key={mode}
+                  style={[
+                    styles.modeButton,
+                    translationMode === mode && styles.modeButtonActive,
+                  ]}
+                  onPress={() => handleModeChange(mode)}
+                  disabled={isRecording || isConnecting}
+                >
+                  <Text
+                    style={[
+                      styles.modeButtonText,
+                      translationMode === mode && styles.modeButtonTextActive,
+                    ]}
+                  >
+                    {mode === "sign" ? "Sign" : mode === "lip" ? "Lip" : "Both"}
+                  </Text>
+                </TouchableOpacity>
+              ))}
             </View>
           </View>
         </View>
 
-        <Card style={styles.liveCard}>
+        {/* Translation Card */}
+        <Card style={styles.card}>
           <Card.Content>
-            <View style={styles.liveCardHeader}>
-              <Text style={styles.liveCardTitle}>
-                {isTranslating ? 'LIVE TRANSLATION' : 'TRANSLATION READY'}
-              </Text>
+            <View style={styles.cardHeader}>
+              <Text style={styles.cardTitle}>Translation</Text>
               {liveTranslation ? (
                 <TouchableOpacity onPress={handleClearTranslation}>
-                  <Text style={styles.clearText}>Clear</Text>
+                  <Text style={styles.clearButton}>Clear</Text>
                 </TouchableOpacity>
               ) : null}
             </View>
-            
-            <View style={styles.liveTranslationArea}>
+
+            <View style={styles.translationArea}>
               {liveTranslation ? (
-                <ScrollView 
-                  style={styles.liveTranslationScroll}
-                  showsVerticalScrollIndicator={false}
-                >
-                  <Text style={styles.liveTranslationText}>
-                    {liveTranslation}
-                  </Text>
-                  {translationResult && (
-                    <View style={styles.translationMeta}>
-                      <Text style={styles.translationMetaText}>
-                        {translationResult.type === 'sign' ? 'Sign Language' : 
-                         translationResult.type === 'lip' ? 'Lip Reading' : 
-                         'Hybrid'} 
-                        {' • '}Confidence: {Math.round((translationResult.confidence || 0) * 100)}%
-                      </Text>
-                    </View>
-                  )}
+                <ScrollView style={styles.translationScroll}>
+                  <Text style={styles.translationText}>{liveTranslation}</Text>
                 </ScrollView>
               ) : (
-                <Text style={styles.placeholderText}>
-                  {!isConnected 
-                    ? 'Connect to server to begin'
-                    : cameraPermission === false
-                    ? 'Enable camera permission to begin'
-                    : isRecording 
-                      ? 'Processing sign/lip movements...' 
-                      : 'Press START to begin translation'}
+                <Text style={styles.placeholder}>
+                  {isRecording
+                    ? "Processing..."
+                    : "Translation will appear here"}
                 </Text>
-              )}
-              
-              {isTranslating && (
-                <View style={styles.modelIndicator}>
-                  <Text style={styles.modelText}>
-                    {isProcessing ? 'Processing Frame...' : 'Ready for next frame'}
-                  </Text>
-                  <ProgressBar 
-                    progress={isProcessing ? 0.7 : 0} 
-                    color={colors.primary}
-                    style={styles.progressBar}
-                  />
-                </View>
               )}
             </View>
           </Card.Content>
         </Card>
 
-        <Animated.View style={{ transform: [{ scale: translateBtnScale }] }}>
-          <TouchableOpacity
-            style={[
-              styles.mainButton,
-              isRecording ? styles.stopButton : styles.startButton,
-              (!isConnected || isConnecting || cameraPermission === false) && styles.disabledButton
-            ]}
-            onPress={handleStartTranslation}
-            disabled={!isConnected || isConnecting || cameraPermission === false}
-            activeOpacity={0.9}
-          >
-            {isConnecting ? (
-              <ActivityIndicator color="#FFFFFF" />
-            ) : cameraPermission === false ? (
-              <>
-                <Text style={styles.mainButtonText}>ENABLE CAMERA</Text>
-                <Text style={styles.mainButtonSubtext}>
-                  Camera permission required to start translation
-                </Text>
-              </>
-            ) : (
-              <>
-                <Text style={styles.mainButtonText}>
-                  {!isConnected 
-                    ? 'DISCONNECTED' 
-                    : isRecording 
-                      ? 'STOP TRANSLATION' 
-                      : 'START TRANSLATION'}
-                </Text>
-                <Text style={styles.mainButtonSubtext}>
-                  {!isConnected
-                    ? 'Server not connected'
-                    : isRecording 
-                      ? 'Real-time streaming to server' 
-                      : 'Word-by-word server processing'}
-                </Text>
-              </>
-            )}
-          </TouchableOpacity>
-        </Animated.View>
+        {/* Control Button */}
+        <TouchableOpacity
+          style={[
+            styles.controlButton,
+            isRecording ? styles.stopButton : styles.startButton,
+            (!isConnected || isConnecting) && styles.disabledButton,
+          ]}
+          onPress={handleToggleTranslation}
+          disabled={!isConnected || isConnecting}
+        >
+          {isConnecting ? (
+            <ActivityIndicator color="#FFFFFF" />
+          ) : (
+            <Text style={styles.controlButtonText}>
+              {isRecording ? "STOP TRANSLATION" : "START TRANSLATION"}
+            </Text>
+          )}
+        </TouchableOpacity>
 
-        <Card style={styles.statsCard}>
+        {/* Stats Card */}
+        <Card style={styles.card}>
           <Card.Content>
-            <Text style={styles.statsTitle}>📊 REAL-TIME PROCESSING STATS</Text>
+            <Text style={styles.cardTitle}>Statistics</Text>
             <View style={styles.statsGrid}>
               <View style={styles.statItem}>
-                <Text style={styles.statValue}>{processingStats.latency}</Text>
-                <Text style={styles.statLabel}>Latency</Text>
+                <Text style={styles.statValue}>
+                  {processingStats.framesSent}
+                </Text>
+                <Text style={styles.statLabel}>Frames</Text>
               </View>
               <View style={styles.statDivider} />
               <View style={styles.statItem}>
-                <Text style={styles.statValue}>{processingStats.fps}</Text>
-                <Text style={styles.statLabel}>FPS</Text>
-              </View>
-              <View style={styles.statDivider} />
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{processingStats.wordsProcessed}</Text>
-                <Text style={styles.statLabel}>Characters</Text>
-              </View>
-              <View style={styles.statDivider} />
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{processingStats.handCount}</Text>
+                <Text style={styles.statValue}>
+                  {processingStats.handCount}
+                </Text>
                 <Text style={styles.statLabel}>Hands</Text>
               </View>
-            </View>
-            <View style={styles.serverContainer}>
-              <IconButton 
-                icon={isConnected ? "server" : "server-off"} 
-                size={20} 
-                color={isConnected ? colors.success : colors.danger} 
-              />
-              <Text style={[
-                styles.serverText,
-                isConnected ? styles.serverTextConnected : styles.serverTextDisconnected
-              ]}>
-                {isConnected 
-                  ? `Connected to ${serverIp} • ${translationMode.toUpperCase()} Mode`
-                  : 'Server offline • Check connection'}
-              </Text>
+              <View style={styles.statDivider} />
+              <View style={styles.statItem}>
+                <Text style={styles.statValue}>
+                  {processingStats.confidence}
+                </Text>
+                <Text style={styles.statLabel}>Confidence</Text>
+              </View>
             </View>
           </Card.Content>
         </Card>
 
+        {/* History */}
         {translationHistory.length > 0 && (
-          <Card style={styles.historyCard}>
+          <Card style={styles.card}>
             <Card.Content>
-              <Text style={styles.historyTitle}>📋 RECENT TRANSLATIONS</Text>
-              <ScrollView 
-                style={styles.historyList}
-                showsVerticalScrollIndicator={false}
-              >
+              <Text style={styles.cardTitle}>Recent Translations</Text>
+              <ScrollView style={styles.historyList}>
                 {translationHistory.map((item) => (
                   <View key={item.id} style={styles.historyItem}>
-                    <View style={styles.historyItemLeft}>
-                      <Text style={styles.historyText}>{item.text}</Text>
-                      <View style={styles.historyMeta}>
-                        <Text style={styles.historyMetaText}>
-                          {item.mode === 'sign' ? 'SIGN' : item.mode === 'lip' ? 'LIP' : 'HYBRID'} 
-                          {' • '}{item.timestamp}
-                          {' • '}{item.processingTime}s
-                        </Text>
-                      </View>
-                    </View>
-                    <View style={styles.confidenceBadge}>
-                      <Text style={styles.confidenceText}>{item.confidence}%</Text>
+                    <Text style={styles.historyText}>{item.text}</Text>
+                    <View style={styles.historyMeta}>
+                      <Text style={styles.historyMetaText}>
+                        {item.confidence}% • {item.timestamp}
+                      </Text>
                     </View>
                   </View>
                 ))}
@@ -1093,112 +516,26 @@ const startTranslation = () => {
             </Card.Content>
           </Card>
         )}
-
-        <View style={styles.infoSection}>
-          <Text style={styles.infoTitle}>ℹ️ REAL-TIME DETECTION FEATURES</Text>
-          <View style={styles.infoGrid}>
-            <View style={styles.infoItem}>
-              <Text style={styles.infoIcon}>SIGN</Text>
-              <Text style={styles.infoItemTitle}>Hand Detection</Text>
-              <Text style={styles.infoItemText}>
-                Real-time hand landmark detection with visual overlay
-              </Text>
-            </View>
-            <View style={styles.infoItem}>
-              <Text style={styles.infoIcon}>LIP</Text>
-              <Text style={styles.infoItemTitle}>Lip Detection</Text>
-              <Text style={styles.infoItemText}>
-                Lip movement tracking with bounding box visualization
-              </Text>
-            </View>
-            <View style={styles.infoItem}>
-              <Text style={styles.infoIcon}>⚡</Text>
-              <Text style={styles.infoItemTitle}>Real-time Overlay</Text>
-              <Text style={styles.infoItemText}>
-                Visual feedback showing detection landmarks and confidence
-              </Text>
-            </View>
-          </View>
-        </View>
       </ScrollView>
 
-      <View style={styles.statusBar}>
-        <View style={styles.statusItem}>
-          <View style={[
-            styles.statusDot, 
-            { backgroundColor: getConnectionStatusColor() }
-          ]} />
-          <Text style={styles.statusText}>
-            {getConnectionStatusText()}
-          </Text>
-        </View>
-        <View style={styles.statusDivider} />
-        <View style={styles.statusItem}>
-          <Text style={styles.statusText}>
-            {isRecording ? `🔄 ${processingStats.fps}FPS` : '✅ Ready'}
-          </Text>
-        </View>
-        <View style={styles.statusDivider} />
-        <View style={styles.statusItem}>
-          <Text style={styles.statusText}>
-            {detectionData ? `🤟 ${detectionData.handCount || 0}` : '🤟 0'}
-          </Text>
-        </View>
-      </View>
-
-<CameraFullScreen
-  visible={showCameraFullScreen}
-  onClose={() => {
-    setShowCameraFullScreen(false);
-    setDetectionData(null);
-    setCameraTranslationText('');
-    if (isRecording) stopTranslation();
-  }}
-  translationMode={translationMode}
-  isTranslating={isRecording} // Use isRecording state
-  detectionData={detectionData}
-  translationText={cameraTranslationText}
-  onStartRecording={startTranslation}
-  onStopRecording={stopTranslation}
-    onCameraReady={(cameraRef) => {
-    // Set camera ref in CameraService
-    CameraService.setCameraRef(cameraRef);
-    setCameraReady(true);
-    console.log('Camera is ready for streaming');
-  }}
-/>
-
-      <Modal
-        visible={showPermissionDialog}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setShowPermissionDialog(false)}
-      >
-        <View style={styles.permissionModal}>
-          <View style={styles.permissionDialog}>
-            <Text style={styles.permissionDialogTitle}>Camera Access Needed</Text>
-            <Text style={styles.permissionDialogText}>
-              To provide sign language translation, this app needs access to your camera.
-              {"\n\n"}
-              Your video is processed locally on your device for maximum privacy.
-            </Text>
-            <View style={styles.permissionDialogButtons}>
-              <TouchableOpacity 
-                style={styles.permissionDialogButtonSecondary}
-                onPress={() => setShowPermissionDialog(false)}
-              >
-                <Text style={styles.permissionDialogButtonTextSecondary}>Not Now</Text>
-              </TouchableOpacity>
-              <TouchableOpacity 
-                style={styles.permissionDialogButtonPrimary}
-                onPress={handleRequestCameraPermission}
-              >
-                <Text style={styles.permissionDialogButtonTextPrimary}>Allow Camera</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
+      {/* Full Screen Camera */}
+      <CameraFullScreen
+        visible={showCameraFullScreen}
+        onClose={() => {
+          setShowCameraFullScreen(false);
+          setDetectionData(null);
+          if (isRecording) stopTranslation();
+        }}
+        translationMode={translationMode}
+        isTranslating={isRecording}
+        detectionData={detectionData}
+        translationText={liveTranslation}
+        onStartRecording={startTranslation}
+        onStopRecording={stopTranslation}
+        onCameraReady={(cameraRef) => {
+          CameraService.setCameraRef(cameraRef);
+        }}
+      />
     </SafeAreaView>
   );
 }
@@ -1206,530 +543,15 @@ const startTranslation = () => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F8FAFF',
-  },
-  connectionBar: {
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    borderBottomWidth: 1,
-    borderBottomColor: '#EAEFFF',
-  },
-  connectionStatus: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 4,
-  },
-  connectionDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 8,
-  },
-  connectionText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: colors.textPrimary,
-    flex: 1,
-  },
-  changeIpButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    backgroundColor: `${colors.primary}15`,
-    borderRadius: 12,
-    marginLeft: 10,
-  },
-  changeIpText: {
-    fontSize: 12,
-    color: colors.primary,
-    fontWeight: '500',
-  },
-  connectionSubtext: {
-    fontSize: 11,
-    color: colors.textSecondary,
-  },
-  errorText: {
-    fontSize: 11,
-    color: colors.danger,
-    fontStyle: 'italic',
-  },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 15,
-    backgroundColor: '#FFFFFF',
-    borderBottomWidth: 1,
-    borderBottomColor: '#EAEFFF',
-  },
-  appName: {
-    fontSize: 22,
-    fontWeight: 'bold',
-    color: colors.primary,
-  },
-  appTagline: {
-    fontSize: 12,
-    color: colors.textSecondary,
-    marginTop: 2,
-  },
-  headerRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  localBadge: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 12,
-    marginLeft: 10,
-  },
-  localBadgeText: {
-    fontSize: 10,
-    fontWeight: 'bold',
-  },
-  scrollView: {
-    flex: 1,
-  },
-  scrollContent: {
-    padding: 20,
-    paddingBottom: 100,
-  },
-  cameraSection: {
-    marginBottom: 20,
-  },
-  cameraPlaceholder: {
-    height: 200,
-    backgroundColor: `${colors.primary}15`,
-    borderRadius: 20,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 2,
-    borderColor: `${colors.primary}30`,
-    borderStyle: 'dashed',
-    marginBottom: 15,
-    overflow: 'hidden',
-    position: 'relative',
-  },
-  cameraPermissionPlaceholder: {
-    backgroundColor: `${colors.warning}15`,
-    borderColor: colors.warning,
-    borderWidth: 2,
-    borderStyle: 'solid',
-  },
-  cameraCheckingPlaceholder: {
-    backgroundColor: `${colors.textSecondary}15`,
-    borderColor: colors.textSecondary,
-  },
-  cameraPlaceholderDisabled: {
-    opacity: 0.6,
-  },
-  permissionIcon: {
-    fontSize: 40,
-    marginBottom: 15,
-    opacity: 0.7,
-  },
-  permissionTitle: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: colors.warning,
-    marginBottom: 8,
-  },
-  permissionText: {
-    fontSize: 14,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    marginBottom: 20,
-    paddingHorizontal: 20,
-  },
-  permissionButton: {
-    backgroundColor: colors.warning,
-    paddingHorizontal: 20,
-    paddingVertical: 10,
-    borderRadius: 25,
-  },
-  permissionButtonText: {
-    color: '#FFFFFF',
-    fontWeight: 'bold',
-    fontSize: 14,
-  },
-  checkingText: {
-    fontSize: 14,
-    color: colors.textSecondary,
-    marginTop: 15,
-    textAlign: 'center',
-  },
-  cameraActiveIndicator: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: colors.danger,
-    marginBottom: 15,
-  },
-  cameraText: {
-    fontSize: 16,
-    color: colors.primary,
-    fontWeight: '500',
-    textAlign: 'center',
-    paddingHorizontal: 20,
-    marginBottom: 10,
-  },
-  cameraStatus: {
-    marginTop: 10,
-    alignItems: 'center',
-  },
-  statusIndicator: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 5,
-  },
-  statusDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
-    marginRight: 6,
-  },
-  cameraStatusText: {
-    fontSize: 12,
-    color: colors.textSecondary,
-  },
-  detectionText: {
-    fontSize: 12,
-    color: colors.success,
-    fontWeight: '500',
-    marginBottom: 5,
-  },
-  processingText: {
-    fontSize: 12,
-    color: colors.primary,
-    fontWeight: '500',
-  },
-  cameraHint: {
-    fontSize: 11,
-    color: colors.textSecondary,
-    marginTop: 8,
-    textAlign: 'center',
-    paddingHorizontal: 20,
-  },
-  cameraEnableText: {
-    color: colors.primary,
-    fontWeight: 'bold',
-    fontSize: 18,
-    marginBottom: 8,
-  },
-  connectingOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(255, 255, 255, 0.9)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  connectingText: {
-    fontSize: 14,
-    color: colors.primary,
-    marginTop: 10,
-    fontWeight: '500',
-  },
-  modeContainer: {
-    marginTop: 10,
-  },
-  modeLabel: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: colors.textPrimary,
-    marginBottom: 10,
-  },
-  modeChips: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-  },
-  modeChip: {
-    backgroundColor: '#FFFFFF',
-    borderColor: `${colors.primary}50`,
-  },
-  modeChipActive: {
-    backgroundColor: `${colors.primary}15`,
-    borderColor: colors.primary,
-  },
-  modeChipText: {
-    color: colors.textSecondary,
-    fontSize: 12,
-  },
-  modeChipTextActive: {
-    color: colors.primary,
-    fontWeight: 'bold',
-  },
-  disabledChip: {
-    opacity: 0.5,
-  },
-  liveCard: {
-    marginBottom: 20,
-    backgroundColor: '#FFFFFF',
-    borderRadius: 20,
-    elevation: 3,
-    shadowColor: colors.primary,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.1,
-    shadowRadius: 12,
-  },
-  liveCardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 15,
-  },
-  liveCardTitle: {
-    fontSize: 16,
-    fontWeight: 'bold',
-    color: colors.primary,
-  },
-  clearText: {
-    fontSize: 14,
-    color: colors.danger,
-    fontWeight: '500',
-  },
-  liveTranslationArea: {
-    minHeight: 120,
-    maxHeight: 200,
-  },
-  liveTranslationScroll: {
-    flex: 1,
-  },
-  liveTranslationText: {
-    fontSize: 20,
-    color: colors.textPrimary,
-    lineHeight: 28,
-    textAlign: 'center',
-    paddingVertical: 10,
-  },
-  translationMeta: {
-    marginTop: 10,
-    paddingTop: 10,
-    borderTopWidth: 1,
-    borderTopColor: '#EAEFFF',
-  },
-  translationMetaText: {
-    fontSize: 12,
-    color: colors.textSecondary,
-    textAlign: 'center',
-  },
-  placeholderText: {
-    fontSize: 16,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    paddingVertical: 40,
-  },
-  modelIndicator: {
-    marginTop: 15,
-    paddingTop: 15,
-    borderTopWidth: 1,
-    borderTopColor: '#EAEFFF',
-  },
-  modelText: {
-    fontSize: 12,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    marginBottom: 5,
-  },
-  progressBar: {
-    height: 4,
-    borderRadius: 2,
-  },
-  mainButton: {
-    paddingVertical: 20,
-    paddingHorizontal: 30,
-    borderRadius: 25,
-    alignItems: 'center',
-    marginBottom: 20,
-    elevation: 5,
-    shadowColor: colors.primary,
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.2,
-    shadowRadius: 10,
-  },
-  startButton: {
-    backgroundColor: colors.primary,
-  },
-  stopButton: {
-    backgroundColor: colors.danger,
-  },
-  disabledButton: {
-    backgroundColor: colors.textSecondary,
-    opacity: 0.7,
-  },
-  mainButtonText: {
-    fontSize: 18,
-    fontWeight: 'bold',
-    color: '#FFFFFF',
-    marginBottom: 5,
-  },
-  mainButtonSubtext: {
-    fontSize: 12,
-    color: '#FFFFFF',
-    opacity: 0.9,
-  },
-  statsCard: {
-    marginBottom: 20,
-    backgroundColor: '#FFFFFF',
-    borderRadius: 20,
-  },
-  statsTitle: {
-    fontSize: 14,
-    fontWeight: 'bold',
-    color: colors.textPrimary,
-    marginBottom: 15,
-  },
-  statsGrid: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 15,
-  },
-  statItem: {
-    alignItems: 'center',
-    flex: 1,
-  },
-  statValue: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: colors.primary,
-    marginBottom: 5,
-  },
-  statLabel: {
-    fontSize: 12,
-    color: colors.textSecondary,
-  },
-  statDivider: {
-    width: 1,
-    height: 40,
-    backgroundColor: '#EAEFFF',
-  },
-  serverContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: `${colors.primary}10`,
-    padding: 12,
-    borderRadius: 12,
-    marginTop: 10,
-  },
-  serverText: {
-    fontSize: 12,
-    fontWeight: '500',
-    marginLeft: 5,
-  },
-  serverTextConnected: {
-    color: colors.success,
-  },
-  serverTextDisconnected: {
-    color: colors.danger,
-  },
-  historyCard: {
-    marginBottom: 20,
-    backgroundColor: '#FFFFFF',
-    borderRadius: 20,
-  },
-  historyTitle: {
-    fontSize: 14,
-    fontWeight: 'bold',
-    color: colors.textPrimary,
-    marginBottom: 15,
-  },
-  historyList: {
-    maxHeight: 200,
-  },
-  historyItem: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F5F5F5',
-  },
-  historyItemLeft: {
-    flex: 1,
-  },
-  historyText: {
-    fontSize: 16,
-    color: colors.textPrimary,
-    marginBottom: 4,
-  },
-  historyMeta: {
-    flexDirection: 'row',
-  },
-  historyMetaText: {
-    fontSize: 12,
-    color: colors.textSecondary,
-  },
-  confidenceBadge: {
-    backgroundColor: `${colors.success}20`,
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 12,
-  },
-  confidenceText: {
-    fontSize: 12,
-    fontWeight: 'bold',
-    color: colors.success,
-  },
-  infoSection: {
-    marginTop: 10,
-  },
-  infoTitle: {
-    fontSize: 14,
-    fontWeight: 'bold',
-    color: colors.textPrimary,
-    marginBottom: 15,
-  },
-  infoGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-  },
-  infoItem: {
-    width: '30%',
-    backgroundColor: '#FFFFFF',
-    padding: 15,
-    borderRadius: 15,
-    alignItems: 'center',
-    marginBottom: 10,
-  },
-  infoIcon: {
-    fontSize: 24,
-    marginBottom: 8,
-  },
-  infoItemTitle: {
-    fontSize: 12,
-    fontWeight: 'bold',
-    color: colors.primary,
-    marginBottom: 5,
-    textAlign: 'center',
-  },
-  infoItemText: {
-    fontSize: 10,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    lineHeight: 14,
+    backgroundColor: "#F5F5F5",
   },
   statusBar: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: '#FFFFFF',
-    borderTopWidth: 1,
-    borderTopColor: '#EAEFFF',
-    flexDirection: 'row',
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 15,
   },
-  statusItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  statusContent: {
+    flexDirection: "row",
+    alignItems: "center",
   },
   statusDot: {
     width: 8,
@@ -1738,71 +560,219 @@ const styles = StyleSheet.create({
     marginRight: 8,
   },
   statusText: {
-    fontSize: 11,
-    color: colors.textSecondary,
-  },
-  statusDivider: {
-    width: 1,
-    height: 20,
-    backgroundColor: '#EAEFFF',
-    marginHorizontal: 15,
-  },
-  permissionModal: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-    justifyContent: 'center',
-    alignItems: 'center',
+    fontSize: 14,
+    color: "#333",
+  },
+  changeIpBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    backgroundColor: "rgba(0,0,0,0.1)",
+    borderRadius: 12,
+  },
+  changeIpText: {
+    fontSize: 12,
+    color: "#333",
+  },
+  header: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: 20,
+    backgroundColor: "#FFFFFF",
+  },
+  title: {
+    fontSize: 24,
+    fontWeight: "bold",
+    color: "#2196F3",
+  },
+  subtitle: {
+    fontSize: 14,
+    color: "#666",
+    marginTop: 2,
+  },
+  scrollView: {
+    flex: 1,
+  },
+  cameraSection: {
     padding: 20,
   },
-  permissionDialog: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 20,
-    padding: 25,
-    width: '100%',
-    maxWidth: 400,
+  cameraCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 15,
+    padding: 20,
+    alignItems: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
   },
-  permissionDialogTitle: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    color: colors.textPrimary,
-    marginBottom: 15,
-    textAlign: 'center',
+  cameraContent: {
+    alignItems: "center",
   },
-  permissionDialogText: {
+  recordingDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: "#F44336",
+    marginBottom: 10,
+  },
+  cameraTitle: {
+    fontSize: 18,
+    fontWeight: "600",
+    color: "#333",
+    marginTop: 10,
+    marginBottom: 5,
+  },
+  cameraSubtitle: {
+    fontSize: 14,
+    color: "#666",
+    textAlign: "center",
+  },
+  modeSection: {
+    marginTop: 20,
+  },
+  modeLabel: {
     fontSize: 16,
-    color: colors.textSecondary,
-    lineHeight: 22,
-    marginBottom: 25,
-    textAlign: 'center',
+    fontWeight: "600",
+    color: "#333",
+    marginBottom: 10,
   },
-  permissionDialogButtons: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 10,
+  modeButtons: {
+    flexDirection: "row",
+    justifyContent: "space-between",
   },
-  permissionDialogButtonSecondary: {
+  modeButton: {
     flex: 1,
-    paddingVertical: 14,
-    borderRadius: 12,
+    paddingVertical: 10,
+    marginHorizontal: 5,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 8,
     borderWidth: 1,
-    borderColor: colors.textSecondary,
-    alignItems: 'center',
+    borderColor: "#DDD",
+    alignItems: "center",
   },
-  permissionDialogButtonTextSecondary: {
-    color: colors.textSecondary,
-    fontWeight: '600',
-    fontSize: 16,
+  modeButtonActive: {
+    backgroundColor: "#2196F3",
+    borderColor: "#2196F3",
   },
-  permissionDialogButtonPrimary: {
+  modeButtonText: {
+    fontSize: 14,
+    color: "#666",
+    fontWeight: "500",
+  },
+  modeButtonTextActive: {
+    color: "#FFFFFF",
+  },
+  card: {
+    marginHorizontal: 20,
+    marginBottom: 15,
+    backgroundColor: "#FFFFFF",
+    borderRadius: 15,
+  },
+  cardHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 15,
+  },
+  cardTitle: {
+    fontSize: 18,
+    fontWeight: "600",
+    color: "#333",
+  },
+  clearButton: {
+    fontSize: 14,
+    color: "#F44336",
+    fontWeight: "500",
+  },
+  translationArea: {
+    minHeight: 100,
+  },
+  translationScroll: {
     flex: 1,
-    paddingVertical: 14,
-    borderRadius: 12,
-    backgroundColor: colors.primary,
-    alignItems: 'center',
   },
-  permissionDialogButtonTextPrimary: {
-    color: '#FFFFFF',
-    fontWeight: '600',
+  translationText: {
     fontSize: 16,
+    color: "#333",
+    lineHeight: 24,
+  },
+  placeholder: {
+    fontSize: 16,
+    color: "#999",
+    textAlign: "center",
+    paddingVertical: 30,
+  },
+  controlButton: {
+    marginHorizontal: 20,
+    marginBottom: 20,
+    paddingVertical: 16,
+    borderRadius: 25,
+    alignItems: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  startButton: {
+    backgroundColor: "#2196F3",
+  },
+  stopButton: {
+    backgroundColor: "#F44336",
+  },
+  disabledButton: {
+    backgroundColor: "#9E9E9E",
+    opacity: 0.7,
+  },
+  controlButtonText: {
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#FFFFFF",
+  },
+  statsGrid: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  statItem: {
+    alignItems: "center",
+    flex: 1,
+  },
+  statValue: {
+    fontSize: 24,
+    fontWeight: "bold",
+    color: "#2196F3",
+    marginBottom: 5,
+  },
+  statLabel: {
+    fontSize: 12,
+    color: "#666",
+  },
+  statDivider: {
+    width: 1,
+    height: 30,
+    backgroundColor: "#EEE",
+  },
+  historyList: {
+    maxHeight: 200,
+  },
+  historyItem: {
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F5F5F5",
+  },
+  historyText: {
+    fontSize: 16,
+    color: "#333",
+    marginBottom: 4,
+  },
+  historyMeta: {
+    flexDirection: "row",
+  },
+  historyMetaText: {
+    fontSize: 12,
+    color: "#666",
   },
 });
